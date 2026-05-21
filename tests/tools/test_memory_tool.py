@@ -20,11 +20,24 @@ from tools.memory_tool import (
 class TestMemorySchema:
     def test_discourages_diary_style_task_logs(self):
         description = MEMORY_SCHEMA["description"]
-        assert "Do NOT save task progress" in description
+        assert "DO NOT SAVE" in description
+        assert "one-off investigations" in description
+        assert "version probes" in description
         assert "session_search" in description
+        assert "current-state profile" in description
         assert "like a diary" not in description
-        assert "temporary task state" in description
+        assert "temporary TODO state" in description
         assert ">80%" not in description
+
+    def test_schema_requires_read_first_guidance(self):
+        description = MEMORY_SCHEMA["description"]
+        assert "READ FIRST" in description
+        assert "same target" in description
+        assert "add is the last resort" in description
+
+    def test_schema_allows_read_action(self):
+        action_schema = MEMORY_SCHEMA["parameters"]["properties"]["action"]
+        assert "read" in action_schema["enum"]
 
 
 # =========================================================================
@@ -183,6 +196,35 @@ class TestMemoryStoreRemove:
         assert result["success"] is False
 
 
+class TestMemoryStoreRead:
+    def test_read_entry(self, store):
+        store.add("memory", "fact A")
+        result = store.read("memory")
+        assert result["success"] is True
+        assert result["target"] == "memory"
+        assert result["entries"] == ["fact A"]
+        assert result["entry_count"] == 1
+        assert result["usage"]
+        assert result["path"].endswith("MEMORY.md")
+
+    def test_read_user_target(self, store):
+        store.add("user", "Name: Alice")
+        result = store.read("user")
+        assert result["success"] is True
+        assert result["target"] == "user"
+        assert result["entries"] == ["Name: Alice"]
+        assert result["path"].endswith("USER.md")
+
+    def test_read_does_not_modify_file(self, store):
+        store.add("memory", "fact A")
+        path = store._path_for("memory")
+        before = path.read_text(encoding="utf-8")
+        result = store.read("memory")
+        after = path.read_text(encoding="utf-8")
+        assert result["success"] is True
+        assert after == before
+
+
 class TestMemoryStorePersistence:
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
@@ -247,6 +289,13 @@ class TestMemoryToolDispatcher:
     def test_add_via_tool(self, store):
         result = json.loads(memory_tool(action="add", target="memory", content="via tool", store=store))
         assert result["success"] is True
+
+    def test_read_via_tool(self, store):
+        memory_tool(action="add", target="memory", content="via tool", store=store)
+        result = json.loads(memory_tool(action="read", target="memory", store=store))
+        assert result["success"] is True
+        assert result["entries"] == ["via tool"]
+        assert result["path"].endswith("MEMORY.md")
 
     def test_replace_requires_old_text(self, store):
         result = json.loads(memory_tool(action="replace", content="new", store=store))

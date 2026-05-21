@@ -1996,6 +1996,7 @@ class AIAgent:
         self._user_profile_enabled = False
         self._memory_nudge_interval = 10
         self._turns_since_memory = 0
+        self._memory_read_targets_this_turn = set()
         self._iters_since_skill = 0
         if not skip_memory:
             try:
@@ -4036,186 +4037,74 @@ class AIAgent:
     # ------------------------------------------------------------------
 
     _MEMORY_REVIEW_PROMPT = (
-        "Review the conversation above and consider saving to memory if appropriate.\n\n"
-        "Focus on:\n"
-        "1. Has the user revealed things about themselves — their persona, desires, "
-        "preferences, or personal details worth remembering?\n"
-        "2. Has the user expressed expectations about how you should behave, their work "
-        "style, or ways they want you to operate?\n\n"
-        "If something stands out, save it using the memory tool. "
-        "If nothing is worth saving, just say 'Nothing to save.' and stop."
+        "Review the conversation above and maintain built-in memory only if "
+        "there is a durable user/profile or environment fact that must affect "
+        "future sessions. Memory is a compact current-state profile, not a "
+        "conversation log.\n\n"
+        "Before any memory write, call memory(action='read', target='user') "
+        "or memory(action='read', target='memory') for the relevant target. "
+        "Compare the new fact with the current entries. Prefer replace or "
+        "remove when an existing entry can be maintained; add is the last "
+        "resort.\n\n"
+        "Save to USER only for stable identity, address, timezone, broad "
+        "communication preferences, or long-lived cross-project preferences. "
+        "Save to MEMORY only for stable runtime/environment facts and durable "
+        "agent-operating constraints.\n\n"
+        "Do not write project status, one-off corrections, task results, "
+        "debug history, schedules, or workflow procedures to memory. Those "
+        "belong in skills or project docs when they are reusable; otherwise "
+        "leave them unsaved. Do not edit skills during this memory-only pass.\n\n"
+        "If no memory entry should be maintained, say 'Nothing to save.' and stop."
     )
 
     _SKILL_REVIEW_PROMPT = (
-        "Review the conversation above and update the skill library. Be "
-        "ACTIVE — most sessions produce at least one skill update, even if "
-        "small. A pass that does nothing is a missed learning opportunity, "
-        "not a neutral outcome.\n\n"
-        "Target shape of the library: CLASS-LEVEL skills, each with a rich "
-        "SKILL.md and a `references/` directory for session-specific detail. "
-        "Not a long flat list of narrow one-session-one-skill entries. This "
-        "shapes HOW you update, not WHETHER you update.\n\n"
-        "Signals to look for (any one of these warrants action):\n"
-        "  • User corrected your style, tone, format, legibility, or "
-        "verbosity. Frustration signals like 'stop doing X', 'this is too "
-        "verbose', 'don't format like this', 'why are you explaining', "
-        "'just give me the answer', 'you always do Y and I hate it', or an "
-        "explicit 'remember this' are FIRST-CLASS skill signals, not just "
-        "memory signals. Update the relevant skill(s) to embed the "
-        "preference so the next session starts already knowing.\n"
-        "  • User corrected your workflow, approach, or sequence of steps. "
-        "Encode the correction as a pitfall or explicit step in the skill "
-        "that governs that class of task.\n"
-        "  • Non-trivial technique, fix, workaround, debugging path, or "
-        "tool-usage pattern emerged that a future session would benefit "
-        "from. Capture it.\n"
-        "  • A skill that got loaded or consulted this session turned out "
-        "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-        "Preference order — prefer the earliest action that fits, but do "
-        "pick one when a signal above fired:\n"
-        "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
-        "conversation for skills the user loaded via /skill-name or you "
-        "read via skill_view. If any of them covers the territory of the "
-        "new learning, PATCH that one first. It is the skill that was in "
-        "play, so it's the right one to extend.\n"
-        "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). "
-        "If no loaded skill fits but an existing class-level skill does, "
-        "patch it. Add a subsection, a pitfall, or broaden a trigger.\n"
-        "  3. ADD A SUPPORT FILE under an existing umbrella. Skills can be "
-        "packaged with three kinds of support files — use the right "
-        "directory per kind:\n"
-        "     • `references/<topic>.md` — session-specific detail (error "
-        "transcripts, reproduction recipes, provider quirks) AND "
-        "condensed knowledge banks: quoted research, API docs, external "
-        "authoritative excerpts, or domain notes you found while working "
-        "on the problem. Write it concise and for the value of the task, "
-        "not as a full mirror of upstream docs.\n"
-        "     • `templates/<name>.<ext>` — starter files meant to be "
-        "copied and modified (boilerplate configs, scaffolding, a "
-        "known-good example the agent can `reproduce with modifications`).\n"
-        "     • `scripts/<name>.<ext>` — statically re-runnable actions "
-        "the skill can invoke directly (verification scripts, fixture "
-        "generators, deterministic probes, anything the agent should run "
-        "rather than hand-type each time).\n"
-        "     Add support files via skill_manage action=write_file with "
-        "file_path starting 'references/', 'templates/', or 'scripts/'. "
-        "The umbrella's SKILL.md should gain a one-line pointer to any "
-        "new support file so future agents know it exists.\n"
-        "  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL when no existing "
-        "skill covers the class. The name MUST be at the class level. "
-        "The name MUST NOT be a specific PR number, error string, feature "
-        "codename, library-alone name, or 'fix-X / debug-Y / audit-Z-today' "
-        "session artifact. If the proposed name only makes sense for "
-        "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
-        "User-preference embedding (important): when the user expressed a "
-        "style/format/workflow preference, the update belongs in the "
-        "SKILL.md body, not just in memory. Memory captures 'who the user "
-        "is and what the current situation and state of your operations "
-        "are'; skills capture 'how to do this class of task for this "
-        "user'. When they complain about how you handled a task, the "
-        "skill that governs that task needs to carry the lesson.\n\n"
-        "If you notice two existing skills that overlap, note it in your "
-        "reply — the background curator handles consolidation at scale.\n\n"
-        "Do NOT capture (these become persistent self-imposed constraints "
-        "that bite you later when the environment changes):\n"
-        "  • Environment-dependent failures: missing binaries, fresh-install "
-        "errors, post-migration path mismatches, 'command not found', "
-        "unconfigured credentials, uninstalled packages. The user can fix "
-        "these — they are not durable rules.\n"
-        "  • Negative claims about tools or features ('browser tools do not "
-        "work', 'X tool is broken', 'cannot use Y from execute_code'). These "
-        "harden into refusals the agent cites against itself for months "
-        "after the actual problem was fixed.\n"
-        "  • Session-specific transient errors that resolved before the "
-        "conversation ended. If retrying worked, the lesson is the retry "
-        "pattern, not the original failure.\n"
-        "  • One-off task narratives. A user asking 'summarize today's "
-        "market' or 'analyze this PR' is not a class of work that warrants "
-        "a skill.\n\n"
-        "If a tool failed because of setup state, capture the FIX (install "
-        "command, config step, env var to set) under an existing setup or "
-        "troubleshooting skill — never 'this tool does not work' as a "
-        "standalone constraint.\n\n"
-        "'Nothing to save.' is a real option but should NOT be the "
-        "default. If the session ran smoothly with no corrections and "
-        "produced no new technique, just say 'Nothing to save.' and stop. "
-        "Otherwise, act."
+        "Review the conversation above and maintain the skill library only "
+        "when a reusable workflow, correction, tool behavior, pitfall, or "
+        "verification method should affect future work. Do not create "
+        "conversation notes or status logs.\n\n"
+        "Inspect existing skills first with skills_list and skill_view. Prefer "
+        "patching an existing skill; use support files for long evidence, "
+        "provider quirks, templates, or scripts; create a new class-level skill "
+        "only when no existing skill fits.\n\n"
+        "Support files: references/ for evidence, provider quirks, API notes, "
+        "and compact task-focused background; templates/ for starter files; "
+        "scripts/ for repeatable verification or probes.\n\n"
+        "User corrections about style, sequence, tooling, or verification belong "
+        "in the skill for the same task class. Avoid entries that merely record "
+        "that the user said something in this conversation.\n\n"
+        "Do not capture project status, completed work, temporary failures, "
+        "debug history, schedules, raw transcripts, one-off context, or negative "
+        "claims about tools as durable rules. If a setup issue mattered, capture "
+        "the fix or command under a relevant setup/troubleshooting skill.\n\n"
+        "If no skill should be maintained, say 'Nothing to save.' and stop."
     )
 
     _COMBINED_REVIEW_PROMPT = (
-        "Review the conversation above and update two things:\n\n"
-        "**Memory**: who the user is. Did the user reveal persona, "
-        "desires, preferences, personal details, or expectations about "
-        "how you should behave? Save facts about the user and durable "
-        "preferences with the memory tool.\n\n"
-        "**Skills**: how to do this class of task. Be ACTIVE — most "
-        "sessions produce at least one skill update. A pass that does "
-        "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
-        "Target shape of the skill library: CLASS-LEVEL skills with a rich "
-        "SKILL.md and a `references/` directory for session-specific detail. "
-        "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-        "Signals that warrant a skill update (any one is enough):\n"
-        "  • User corrected your style, tone, format, legibility, "
-        "verbosity, or approach. Frustration is a FIRST-CLASS skill "
-        "signal, not just a memory signal. 'stop doing X', 'don't format "
-        "like this', 'I hate when you Y' — embed the lesson in the skill "
-        "that governs that task so the next session starts fixed.\n"
-        "  • Non-trivial technique, fix, workaround, or debugging path "
-        "emerged.\n"
-        "  • A skill that was loaded or consulted turned out wrong, "
-        "missing, or outdated — patch it now.\n\n"
-        "Preference order for skills — pick the earliest that fits:\n"
-        "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
-        "loaded via /skill-name or skill_view in the conversation. If one "
-        "of them covers the learning, PATCH it first. It was in play; "
-        "it's the right place.\n"
-        "  2. UPDATE AN EXISTING UMBRELLA (skills_list + skill_view to "
-        "find the right one). Patch it.\n"
-        "  3. ADD A SUPPORT FILE under an existing umbrella via "
-        "skill_manage action=write_file. Three kinds: "
-        "`references/<topic>.md` for session-specific detail OR condensed "
-        "knowledge banks (quoted research, API docs excerpts, domain "
-        "notes) written concise and task-focused; `templates/<name>.<ext>` "
-        "for starter files meant to be copied and modified; "
-        "`scripts/<name>.<ext>` for statically re-runnable actions "
-        "(verification, fixture generators, probes). Add a one-line "
-        "pointer in SKILL.md so future agents find them.\n"
-        "  4. CREATE A NEW CLASS-LEVEL UMBRELLA when nothing exists. "
-        "Name at the class level — NOT a PR number, error string, "
-        "codename, library-alone name, or 'fix-X / debug-Y' session "
-        "artifact. If the name only fits today's task, fall back to (1), "
-        "(2), or (3).\n\n"
-        "User-preference embedding: when the user complains about how "
-        "you handled a task, update the skill that governs that task — "
-        "memory alone isn't enough. Memory says 'who the user is and "
-        "what the current situation and state of your operations are'; "
-        "skills say 'how to do this class of task for this user'. Both "
-        "should carry user-preference lessons when relevant.\n\n"
-        "If you notice overlapping existing skills, mention it — the "
-        "background curator handles consolidation.\n\n"
-        "Do NOT capture as skills (these become persistent self-imposed "
-        "constraints that bite you later when the environment changes):\n"
-        "  • Environment-dependent failures: missing binaries, fresh-install "
-        "errors, post-migration path mismatches, 'command not found', "
-        "unconfigured credentials, uninstalled packages. The user can fix "
-        "these — they are not durable rules.\n"
-        "  • Negative claims about tools or features ('browser tools do not "
-        "work', 'X tool is broken', 'cannot use Y from execute_code'). These "
-        "harden into refusals the agent cites against itself for months "
-        "after the actual problem was fixed.\n"
-        "  • Session-specific transient errors that resolved before the "
-        "conversation ended. If retrying worked, the lesson is the retry "
-        "pattern, not the original failure.\n"
-        "  • One-off task narratives. A user asking 'summarize today's "
-        "market' or 'analyze this PR' is not a class of work that warrants "
-        "a skill.\n\n"
-        "If a tool failed because of setup state, capture the FIX (install "
-        "command, config step, env var to set) under an existing setup or "
-        "troubleshooting skill — never 'this tool does not work' as a "
-        "standalone constraint.\n\n"
-        "Act on whichever of the two dimensions has real signal. If "
-        "genuinely nothing stands out on either, say 'Nothing to save.' "
-        "and stop — but don't reach for that conclusion as a default."
+        "Review the conversation above and maintain memory and skills with "
+        "different scopes. Default to no action unless a durable update is "
+        "clearly needed.\n\n"
+        "Memory scope: compact current-state profile. Before any memory write, "
+        "call memory(action='read', target='user') or memory(action='read', "
+        "target='memory') for the relevant target. Prefer replace/remove over "
+        "add; add is the last resort. USER is for stable identity, address, "
+        "timezone, broad communication preferences, and long-lived cross-project "
+        "preferences. MEMORY is for stable environment facts and durable agent "
+        "operating constraints. Do not store project status, one-off corrections, "
+        "task results, debug history, schedules, or procedures in memory.\n\n"
+        "Skill scope: maintained operating procedures. If a correction, workflow "
+        "lesson, tool behavior, pitfall, or verification method should affect "
+        "future work for a task class, put it in the relevant skill. Inspect "
+        "existing skills first with skills_list/skill_view. Prefer patching an "
+        "existing skill; use support files for long evidence/templates/scripts; "
+        "create a new class-level skill only when no existing skill fits.\n\n"
+        "When a fact could be either memory or skill, choose skill if it is about "
+        "how to do work, and choose memory only if it is about who the user is "
+        "or a stable execution environment. Never duplicate the same lesson in "
+        "both places unless both scopes genuinely need different wording.\n\n"
+        "Do not create historical logs of this conversation. Do not store project "
+        "status, completed work, task results, debug history, schedules, or raw "
+        "transcripts as durable entries. Maintain existing entries where possible. "
+        "If nothing needs maintenance, say 'Nothing to save.' and stop."
     )
 
     @staticmethod
@@ -4527,6 +4416,71 @@ class AIAgent:
         if tool_call_id:
             metadata["tool_call_id"] = tool_call_id
         return {k: v for k, v in metadata.items() if v not in {None, ""}}
+
+    def _dispatch_memory_tool(
+        self,
+        function_args: Dict[str, Any],
+        *,
+        task_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> str:
+        """Run the built-in memory tool with a read-before-write guard."""
+        target = function_args.get("target", "memory")
+        action = function_args.get("action")
+        mutating_actions = {"add", "replace", "remove"}
+
+        if (
+            target in {"memory", "user"}
+            and action in mutating_actions
+            and target not in getattr(self, "_memory_read_targets_this_turn", set())
+        ):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Memory writes require reading the target first in this turn. "
+                    "Call memory(action='read', target='%s') before add/replace/remove."
+                ) % target,
+                "target": target,
+                "requires_read_first": True,
+            }, ensure_ascii=False)
+
+        from tools.memory_tool import memory_tool as _memory_tool
+        result = _memory_tool(
+            action=action,
+            target=target,
+            content=function_args.get("content"),
+            old_text=function_args.get("old_text"),
+            store=self._memory_store,
+        )
+
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            parsed = {}
+        success = bool(isinstance(parsed, dict) and parsed.get("success"))
+
+        if success and action == "read":
+            self._memory_read_targets_this_turn.add(target)
+            self._turns_since_memory = 0
+        elif success and action in mutating_actions:
+            self._turns_since_memory = 0
+
+        # Bridge: notify external memory provider of successful built-in writes.
+        if self._memory_manager and success and action in {"add", "replace"}:
+            try:
+                self._memory_manager.on_memory_write(
+                    action,
+                    target,
+                    function_args.get("content", ""),
+                    metadata=self._build_memory_write_metadata(
+                        task_id=task_id,
+                        tool_call_id=tool_call_id,
+                    ),
+                )
+            except Exception:
+                pass
+
+        return result
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
@@ -10957,30 +10911,11 @@ class AIAgent:
                 current_session_id=self.session_id,
             )
         elif function_name == "memory":
-            target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=function_args.get("action"),
-                target=target,
-                content=function_args.get("content"),
-                old_text=function_args.get("old_text"),
-                store=self._memory_store,
+            return self._dispatch_memory_tool(
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id,
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in {"add", "replace"}:
-                try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                        metadata=self._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=tool_call_id,
-                        ),
-                    )
-                except Exception:
-                    pass
-            return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
@@ -11052,10 +10987,10 @@ class AIAgent:
         for tool_call in tool_calls:
             function_name = tool_call.function.name
 
-            # Reset nudge counters
-            if function_name == "memory":
-                self._turns_since_memory = 0
-            elif function_name == "skill_manage":
+            # Reset skill nudge counter when the relevant tool is actually used.
+            # Memory nudge resets inside _dispatch_memory_tool after a successful
+            # read/write; a blocked direct write should not count as maintenance.
+            if function_name == "skill_manage":
                 self._iters_since_skill = 0
 
             try:
@@ -11487,9 +11422,9 @@ class AIAgent:
                 # Tool blocked by plugin or guardrail policy — skip counters,
                 # callbacks, checkpointing, activity mutation, and real execution.
                 pass
-            # Reset nudge counters when the relevant tool is actually used
-            elif function_name == "memory":
-                self._turns_since_memory = 0
+            # Reset skill nudge counter when the relevant tool is actually used.
+            # Memory nudge resets inside _dispatch_memory_tool after a successful
+            # read/write; a blocked direct write should not count as maintenance.
             elif function_name == "skill_manage":
                 self._iters_since_skill = 0
 
@@ -11592,29 +11527,11 @@ class AIAgent:
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
-                target = function_args.get("target", "memory")
-                from tools.memory_tool import memory_tool as _memory_tool
-                function_result = _memory_tool(
-                    action=function_args.get("action"),
-                    target=target,
-                    content=function_args.get("content"),
-                    old_text=function_args.get("old_text"),
-                    store=self._memory_store,
+                function_result = self._dispatch_memory_tool(
+                    function_args,
+                    task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", None),
                 )
-                # Bridge: notify external memory provider of built-in memory writes
-                if self._memory_manager and function_args.get("action") in {"add", "replace"}:
-                    try:
-                        self._memory_manager.on_memory_write(
-                            function_args.get("action", ""),
-                            target,
-                            function_args.get("content", ""),
-                            metadata=self._build_memory_write_metadata(
-                                task_id=effective_task_id,
-                                tool_call_id=getattr(tool_call, "id", None),
-                            ),
-                        )
-                    except Exception:
-                        pass
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -12272,6 +12189,7 @@ class AIAgent:
         
         # Track user turns for memory flush and periodic nudge logic
         self._user_turn_count += 1
+        self._memory_read_targets_this_turn = set()
 
         # Reset the streaming context scrubber at the top of each turn so a
         # hung span from a prior interrupted stream can't taint this turn's

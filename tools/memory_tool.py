@@ -355,6 +355,13 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
+    def read(self, target: str) -> Dict[str, Any]:
+        """Return the current entries for target without modifying disk."""
+        self._reload_target(target)
+        result = self._success_response(target, "Entries read.")
+        result["path"] = str(self._path_for(target))
+        return result
+
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
         Return the frozen snapshot for system prompt injection.
@@ -494,8 +501,11 @@ def memory_tool(
             return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
 
+    elif action == "read":
+        result = store.read(target)
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -512,34 +522,32 @@ def check_memory_requirements() -> bool:
 MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
-        "Save durable information to persistent memory that survives across sessions. "
-        "Memory is injected into future turns, so keep it compact and focused on facts "
-        "that will still matter later.\n\n"
-        "WHEN TO SAVE (do this proactively, don't wait to be asked):\n"
-        "- User corrects you or says 'remember this' / 'don't do that again'\n"
-        "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"
-        "- You discover something about the environment (OS, installed tools, project structure)\n"
-        "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
-        "- You identify a stable fact that will be useful again in future sessions\n\n"
-        "PRIORITY: User preferences and corrections > environment facts > procedural knowledge. "
-        "The most valuable memory prevents the user from having to repeat themselves.\n\n"
-        "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-        "state to memory; use session_search to recall those from past transcripts.\n"
-        "If you've discovered a new way to do something, solved a problem that could be "
-        "necessary later, save it as a skill with the skill tool.\n\n"
+        "Maintain compact persistent memory that survives across sessions. Memory is "
+        "injected into future turns, so only store durable facts that materially change "
+        "future behavior. Memory is a current-state profile, not a conversation log.\n\n"
+        "READ FIRST: before add, replace, or remove, call read for the same target in "
+        "the current turn and compare against existing entries. Prefer replace/remove "
+        "over add; add is the last resort.\n\n"
+        "SAVE TO USER only for stable identity, form of address, timezone, broad "
+        "communication preferences, or long-lived cross-project preferences.\n"
+        "SAVE TO MEMORY only for stable runtime/environment facts or durable agent "
+        "operating constraints.\n\n"
+        "DO NOT SAVE: one-off investigations, version probes, task results, completed-work "
+        "logs, debug history, schedules, temporary TODO state, project status, raw dumps, "
+        "or procedural workflows. Use session_search for past task details; use skills "
+        "for reusable procedures, tool behavior, pitfalls, and verification methods.\n\n"
         "TWO TARGETS:\n"
-        "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
-        "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
-        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
+        "- 'user': who the user is -- identity and stable broad preferences\n"
+        "- 'memory': stable environment/runtime facts and durable agent constraints\n\n"
+        "ACTIONS: read (inspect current entries before deciding), add (new entry), "
+        "replace (update existing -- old_text identifies it), remove (delete -- old_text identifies it)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read"],
                 "description": "The action to perform."
             },
             "target": {

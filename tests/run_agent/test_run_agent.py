@@ -2203,6 +2203,65 @@ class TestConcurrentToolExecution:
         assert json.loads(result) == {"error": "Blocked"}
         assert agent._turns_since_memory == 5
 
+    def test_memory_write_requires_read_first(self, agent, tmp_path, monkeypatch):
+        from tools.memory_tool import MemoryStore
+
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        store = MemoryStore()
+        store.load_from_disk()
+        agent._memory_store = store
+        agent._memory_manager = None
+        agent._memory_read_targets_this_turn = set()
+        agent._turns_since_memory = 5
+
+        direct_write = json.loads(agent._dispatch_memory_tool({
+            "action": "add",
+            "target": "memory",
+            "content": "one-off probe result",
+        }))
+
+        assert direct_write["success"] is False
+        assert direct_write["requires_read_first"] is True
+        assert store.read("memory")["entries"] == []
+        assert agent._turns_since_memory == 5
+
+        read_result = json.loads(agent._dispatch_memory_tool({
+            "action": "read",
+            "target": "memory",
+        }))
+        assert read_result["success"] is True
+        assert "memory" in agent._memory_read_targets_this_turn
+        assert agent._turns_since_memory == 0
+
+        allowed_write = json.loads(agent._dispatch_memory_tool({
+            "action": "add",
+            "target": "memory",
+            "content": "Environment: stable test fact",
+        }))
+        assert allowed_write["success"] is True
+        assert store.read("memory")["entries"] == ["Environment: stable test fact"]
+
+    def test_memory_write_requires_read_of_same_target(self, agent, tmp_path, monkeypatch):
+        from tools.memory_tool import MemoryStore
+
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        store = MemoryStore()
+        store.load_from_disk()
+        agent._memory_store = store
+        agent._memory_manager = None
+        agent._memory_read_targets_this_turn = set()
+
+        json.loads(agent._dispatch_memory_tool({"action": "read", "target": "memory"}))
+        user_write = json.loads(agent._dispatch_memory_tool({
+            "action": "add",
+            "target": "user",
+            "content": "User prefers tests",
+        }))
+
+        assert user_write["success"] is False
+        assert user_write["target"] == "user"
+        assert store.read("user")["entries"] == []
+
 
 class TestPathsOverlap:
     """Unit tests for the _paths_overlap helper."""
