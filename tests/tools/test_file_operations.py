@@ -449,6 +449,75 @@ class TestSearchFilesFallbackHiddenPaths:
         assert set(result.files) == {str(visible_file), str(visible_nested_file)}
 
 
+class TestSearchFilesFallbacks:
+    def test_files_search_uses_fdfind_before_find_when_rg_missing(self, mock_env):
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v rg" in command:
+                return {"output": "", "returncode": 1}
+            if "command -v fdfind" in command:
+                return {"output": "yes", "returncode": 0}
+            if "command -v fd" in command:
+                return {"output": "", "returncode": 1}
+            if command.startswith("fdfind "):
+                return {"output": "/tmp/.hidden/a.py\n", "returncode": 0}
+            return {"output": "", "returncode": 1}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.search("*.py", path="/tmp/.hidden", target="files", limit=1)
+
+        assert result.files == ["/tmp/.hidden/a.py"]
+        assert result.total_count == 1
+        assert result.truncated is True
+        assert any(command.startswith("fdfind ") for command in commands)
+        assert not any(command.startswith("find ") for command in commands)
+
+    def test_files_search_prefers_fd_over_fdfind(self, mock_env):
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v rg" in command:
+                return {"output": "", "returncode": 1}
+            if "command -v fd" in command:
+                return {"output": "yes", "returncode": 0}
+            if command.startswith("fd "):
+                return {"output": "/tmp/project/main.py\n", "returncode": 0}
+            return {"output": "", "returncode": 1}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.search("main.py", path="/tmp/project", target="files")
+
+        assert result.files == ["/tmp/project/main.py"]
+        assert any(command.startswith("fd ") for command in commands)
+        assert not any("command -v fdfind" in command for command in commands)
+        assert not any(command.startswith("find ") for command in commands)
+
+    def test_files_search_error_mentions_fd_when_no_search_command(self, mock_env):
+        def side_effect(command, **kwargs):
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v" in command:
+                return {"output": "", "returncode": 1}
+            return {"output": "", "returncode": 1}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.search("*.py", path="/tmp/project", target="files")
+
+        assert result.error is not None
+        assert "fd" in result.error
+        assert "find" in result.error
+
+
 class TestShellFileOpsWriteDenied:
     def test_write_file_denied_path(self, file_ops):
         result = file_ops.write_file("~/.ssh/authorized_keys", "evil key")

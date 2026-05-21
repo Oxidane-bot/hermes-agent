@@ -1508,10 +1508,18 @@ class ShellFileOperations(FileOperations):
         if self._has_command('rg'):
             return self._search_files_rg(search_pattern, path, limit, offset)
 
+        # Next prefer fd/fdfind: it is much faster than find and, unlike the
+        # find fallback below, still works when the explicitly searched root is
+        # a hidden directory (for example ~/.hermes/hermes-agent).  It does not
+        # provide mtime sorting, so rg remains the only sorted path.
+        fd_cmd = self._get_fd_command()
+        if fd_cmd:
+            return self._search_files_fd(fd_cmd, search_pattern, path, limit, offset)
+
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
             return SearchResult(
-                error="File search requires 'rg' (ripgrep) or 'find'. "
+                error="File search requires 'rg' (ripgrep), 'fd'/'fdfind', or 'find'. "
                       "Install ripgrep for best results: "
                       "https://github.com/BurntSushi/ripgrep#installation"
             )
@@ -1568,6 +1576,44 @@ class ShellFileOperations(FileOperations):
         return SearchResult(
             files=files,
             total_count=len(files)
+        )
+
+    def _get_fd_command(self) -> Optional[str]:
+        """Return the available fd command name, preferring upstream 'fd'."""
+        if self._has_command('fd'):
+            return 'fd'
+        if self._has_command('fdfind'):
+            return 'fdfind'
+        return None
+
+    def _search_files_fd(self, fd_cmd: str, pattern: str, path: str,
+                         limit: int, offset: int) -> SearchResult:
+        """Search for files by name using fd/fdfind.
+
+        fd is the preferred fallback when rg is unavailable: it is fast,
+        respects ignore files like rg, and can search explicitly provided
+        hidden roots. It does not support mtime sorting, so rg remains the
+        only modified-time ordered implementation.
+        """
+        if '/' not in pattern and not pattern.startswith('*'):
+            glob_pattern = f"*{pattern}"
+        else:
+            glob_pattern = pattern
+
+        fetch_limit = limit + offset
+        cmd = (
+            f"{fd_cmd} -t f -g {self._escape_shell_arg(glob_pattern)} "
+            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"| head -n {fetch_limit}"
+        )
+        result = self._exec(cmd, timeout=60)
+        all_files = [f for f in result.stdout.strip().split('\n') if f]
+        page = all_files[offset:offset + limit]
+
+        return SearchResult(
+            files=page,
+            total_count=len(all_files),
+            truncated=len(all_files) >= fetch_limit,
         )
 
     def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
