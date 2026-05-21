@@ -9,6 +9,8 @@ import io
 import json
 import logging
 import re
+import threading
+import time
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -2859,6 +2861,102 @@ class TestRunConversation:
         assert fallback_called["called"], "Fallback should have been triggered"
         assert result["completed"] is True
         assert result["final_response"] == "Fallback answer."
+
+    def test_stale_api_timeout_triggers_fallback_provider_immediately(self, agent):
+        """A no-response stale timeout should fail over instead of burning retry budget."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+
+        timeout = TimeoutError("Non-streaming API call timed out after 120s with no response (threshold: 120s)")
+        content_resp = _mock_response(content="Recovered via fallback.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [timeout, content_resp]
+
+        fallback_called = {"called": False}
+
+        def _mock_fallback(reason=None):
+            fallback_called["called"] = True
+            assert reason == FailoverReason.timeout
+            agent._fallback_index = 1
+            agent._fallback_activated = True
+            agent.model = "anthropic/claude-sonnet-4"
+            agent.provider = "openrouter"
+            return True
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert fallback_called["called"], "Stale timeout should trigger fallback immediately"
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered via fallback."
+
+    def test_streaming_stale_timeout_triggers_fallback_provider(self, agent, monkeypatch):
+        """A stream that ignores connection close should surface TimeoutError for fallback."""
+        self._setup_agent(agent)
+        agent.base_url = "https://cloud-provider.example/v1"
+        agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+        agent._has_stream_consumers = MagicMock(return_value=True)
+        agent._compute_non_stream_stale_timeout = MagicMock(return_value=999)
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.01")
+
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+
+        class KeepaliveOnlyStream:
+            response = None
+
+            def __iter__(self):
+                first_call_started.set()
+                while not release_first_call.is_set():
+                    yield SimpleNamespace(choices=[], model="keepalive-only")
+                    time.sleep(0.002)
+
+        content_resp = _mock_response(content="Recovered via streaming fallback.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [KeepaliveOnlyStream(), content_resp]
+
+        fallback_called = {"called": False}
+
+        def _mock_fallback(reason=None):
+            fallback_called["called"] = True
+            assert reason == FailoverReason.timeout
+            agent._fallback_index = 1
+            agent._fallback_activated = True
+            agent.model = "anthropic/claude-sonnet-4"
+            agent.provider = "openrouter"
+            # After fallback, use non-streaming so the test can return a simple
+            # mocked ChatCompletion response without modeling a full stream.
+            agent._disable_streaming = True
+            release_first_call.set()
+            return True
+
+        def _close_client(_client, *, reason):
+            release_first_call.set()
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+            patch.object(agent, "_close_request_openai_client", side_effect=_close_client),
+            patch.object(agent, "_replace_primary_openai_client", return_value=True),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert first_call_started.is_set(), "Streaming call should have started"
+        assert fallback_called["called"], "Streaming stale timeout should trigger fallback"
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered via streaming fallback."
 
     def test_empty_response_fallback_also_empty_returns_empty(self, agent):
         """If fallback also returns empty, final response is (empty)."""

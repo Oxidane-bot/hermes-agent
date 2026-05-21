@@ -8119,6 +8119,7 @@ class AIAgent:
         # poll loop uses this to detect stale connections that keep receiving
         # SSE keep-alive pings but no actual data.
         last_chunk_time = {"t": time.time()}
+        last_real_chunk_time = {"t": time.time()}
 
         def _fire_first_delta():
             if not first_delta_fired["done"] and on_first_delta:
@@ -8173,6 +8174,7 @@ class AIAgent:
             # Reset stale-stream timer so the detector measures from this
             # attempt's start, not a previous attempt's last chunk.
             last_chunk_time["t"] = time.time()
+            last_real_chunk_time["t"] = last_chunk_time["t"]
             self._touch_activity("waiting for provider response (streaming)")
             # Initialize per-attempt stream diagnostics so the retry block can
             # reach for them after the stream dies.  Lives on
@@ -8247,12 +8249,14 @@ class AIAgent:
                 # Accumulate reasoning content
                 reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                 if reasoning_text:
+                    last_real_chunk_time["t"] = time.time()
                     reasoning_parts.append(reasoning_text)
                     _fire_first_delta()
                     self._fire_reasoning_delta(reasoning_text)
 
                 # Accumulate text content — fire callback only when no tool calls
                 if delta and delta.content:
+                    last_real_chunk_time["t"] = time.time()
                     content_parts.append(delta.content)
                     if not tool_calls_acc:
                         _fire_first_delta()
@@ -8309,6 +8313,7 @@ class AIAgent:
                             entry["id"] = tc_delta.id
                         if tc_delta.function:
                             if tc_delta.function.name:
+                                last_real_chunk_time["t"] = time.time()
                                 # Use assignment, not +=.  Function names are
                                 # atomic identifiers delivered complete in the
                                 # first chunk (OpenAI spec).  Some providers
@@ -8319,6 +8324,7 @@ class AIAgent:
                                 # Vercel AI patterns) is immune to this.
                                 entry["function"]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
+                                last_real_chunk_time["t"] = time.time()
                                 entry["function"]["arguments"] += tc_delta.function.arguments
                         extra = getattr(tc_delta, "extra_content", None)
                         if extra is None and hasattr(tc_delta, "model_extra"):
@@ -8422,6 +8428,7 @@ class AIAgent:
 
             # Reset stale-stream timer for this attempt
             last_chunk_time["t"] = time.time()
+            last_real_chunk_time["t"] = last_chunk_time["t"]
             # Per-attempt diagnostic dict for the retry block to consume.
             _diag = self._stream_diag_init()
             request_client_holder["diag"] = _diag
@@ -8470,6 +8477,7 @@ class AIAgent:
                             has_tool_use = True
                             tool_name = getattr(block, "name", None)
                             if tool_name:
+                                last_real_chunk_time["t"] = time.time()
                                 _fire_first_delta()
                                 self._fire_tool_gen_started(tool_name)
 
@@ -8480,12 +8488,14 @@ class AIAgent:
                             if delta_type == "text_delta":
                                 text = getattr(delta, "text", "")
                                 if text and not has_tool_use:
+                                    last_real_chunk_time["t"] = time.time()
                                     _fire_first_delta()
                                     self._fire_stream_delta(text)
                                     deltas_were_sent["yes"] = True
                             elif delta_type == "thinking_delta":
                                 thinking_text = getattr(delta, "thinking", "")
                                 if thinking_text:
+                                    last_real_chunk_time["t"] = time.time()
                                     _fire_first_delta()
                                     self._fire_reasoning_delta(thinking_text)
 
@@ -8793,7 +8803,7 @@ class AIAgent:
             _hb_now = time.time()
             if _hb_now - _last_heartbeat >= _HEARTBEAT_INTERVAL:
                 _last_heartbeat = _hb_now
-                _waiting_secs = int(_hb_now - last_chunk_time["t"])
+                _waiting_secs = int(_hb_now - last_real_chunk_time["t"])
                 self._touch_activity(
                     f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
                 )
@@ -8801,7 +8811,7 @@ class AIAgent:
             # Detect stale streams: connections kept alive by SSE pings
             # but delivering no real chunks.  Kill the client so the
             # inner retry loop can start a fresh connection.
-            _stale_elapsed = time.time() - last_chunk_time["t"]
+            _stale_elapsed = time.time() - last_real_chunk_time["t"]
             if _stale_elapsed > _stream_stale_timeout:
                 _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
                 logger.warning(
@@ -8828,12 +8838,20 @@ class AIAgent:
                     self._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
                 except Exception:
                     pass
-                # Reset the timer so we don't kill repeatedly while
-                # the inner thread processes the closure.
-                last_chunk_time["t"] = time.time()
+                # Surface the stale stream to the main retry/fallback loop
+                # immediately. Previously this only reset the timer and kept
+                # waiting for the worker thread; when a provider ignored the
+                # closed connection, long clean-room runs could hang until an
+                # external timeout killed Hermes instead of trying fallback.
+                if result["error"] is None and result["response"] is None:
+                    result["error"] = TimeoutError(
+                        f"Streaming API call timed out after {int(_stale_elapsed)}s "
+                        f"with no chunks (threshold: {int(_stream_stale_timeout)}s)"
+                    )
                 self._touch_activity(
                     f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
                 )
+                break
 
             if self._interrupt_requested:
                 try:
@@ -13827,6 +13845,25 @@ class AIAgent:
                     )
                     if recovered_with_pool:
                         continue
+
+                    # Clean-room / long-running automation can otherwise spend
+                    # many minutes retrying the same silent upstream stall before
+                    # the configured fallback chain is even attempted.  The
+                    # stale-call detector raises this exact TimeoutError after
+                    # forcibly closing a no-chunk/no-response request; treat it
+                    # as a failover trigger, not as ordinary backoff.
+                    is_stale_api_timeout = (
+                        classified.reason == FailoverReason.timeout
+                        and isinstance(api_error, TimeoutError)
+                        and "api call timed out" in str(api_error).lower()
+                    )
+                    if is_stale_api_timeout and self._fallback_index < len(self._fallback_chain):
+                        self._emit_status("⚠️ Provider stalled with no response — switching to fallback provider...")
+                        if self._try_activate_fallback(reason=classified.reason):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
 
                     # Image-too-large recovery: shrink oversized native image
                     # parts in-place and retry once.  Triggered by Anthropic's
