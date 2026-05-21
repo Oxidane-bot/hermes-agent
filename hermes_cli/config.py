@@ -771,6 +771,10 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
+        "abort_on_summary_failure": True,  # preserve the full transcript when
+                                      # summary generation fails instead of
+                                      # replacing the middle window with a
+                                      # static placeholder.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

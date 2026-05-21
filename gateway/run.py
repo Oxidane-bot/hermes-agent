@@ -7555,14 +7555,30 @@ class GatewayRunner:
                                             f"{_new_tokens:,}",
                                         )
 
-                                    # If summary generation failed, the
-                                    # compressor inserted a static fallback
-                                    # placeholder and the dropped turns are
-                                    # gone for good.  Surface a visible
-                                    # warning to the gateway user — agent.log
-                                    # alone is invisible on TG/Discord/etc.
+                                    # If summary generation failed in fail-closed mode,
+                                    # the compressor aborts and preserves the transcript.
+                                    # Surface a visible warning to the gateway user —
+                                    # agent.log alone is invisible on TG/Discord/etc.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
-                                    if _comp is not None and getattr(_comp, "_last_summary_fallback_used", False):
+                                    if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
+                                        _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
+                                        _warn_msg = (
+                                            "⚠️ Context compression aborted "
+                                            f"({_err}). No messages were dropped; "
+                                            "context remains unchanged. Run /compress "
+                                            "to retry, /reset for a clean session, or "
+                                            "check your auxiliary.compression model configuration."
+                                        )
+                                        try:
+                                            _adapter = self.adapters.get(source.platform)
+                                            if _adapter and source.chat_id:
+                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
+                                        except Exception as _werr:
+                                            logger.warning(
+                                                "Failed to deliver compression-failure warning to user: %s",
+                                                _werr,
+                                            )
+                                    elif _comp is not None and getattr(_comp, "_last_summary_fallback_used", False):
                                         _dropped = getattr(_comp, "_last_summary_dropped_count", 0)
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         _warn_msg = (
@@ -11143,7 +11159,7 @@ class GatewayRunner:
                 loop = asyncio.get_running_loop()
                 compressed, _ = await loop.run_in_executor(
                     None,
-                    lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic)
+                    lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True)
                 )
 
                 # _compress_context already calls end_session() on the old session

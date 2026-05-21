@@ -2152,6 +2152,9 @@ class AIAgent:
         compression_protect_first = max(
             0, int(_compression_cfg.get("protect_first_n", 3))
         )
+        compression_abort_on_summary_failure = str(
+            _compression_cfg.get("abort_on_summary_failure", True)
+        ).lower() in {"true", "1", "yes"}
 
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
@@ -2366,6 +2369,7 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 api_mode=self.api_mode,
+                abort_on_summary_failure=compression_abort_on_summary_failure,
             )
         self.compression_enabled = compression_enabled
 
@@ -10625,7 +10629,7 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
+    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, force: bool = False) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
         Args:
@@ -10655,11 +10659,22 @@ class AIAgent:
                 pass
 
         try:
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
         except TypeError:
             # Plugin context engine with strict signature that doesn't accept
-            # focus_topic — fall back to calling without it.
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+            # focus_topic/force — fall back to the older calling conventions.
+            try:
+                compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+            except TypeError:
+                compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+
+        if getattr(self.context_compressor, "_last_compress_aborted", False) is True:
+            summary_error = getattr(self.context_compressor, "_last_summary_error", None) or "unknown error"
+            self._emit_warning(
+                f"⚠ Compression aborted: {summary_error}. "
+                "No messages were dropped; context remains unchanged."
+            )
+            return messages, system_message
 
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
         if summary_error:

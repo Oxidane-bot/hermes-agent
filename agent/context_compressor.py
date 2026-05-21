@@ -367,6 +367,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_compress_aborted = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
@@ -415,6 +416,7 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
+        abort_on_summary_failure: bool = True,
     ):
         self.model = model
         self.base_url = base_url
@@ -426,6 +428,10 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
+        # Local fork default: summary-generation failure aborts compression
+        # and preserves the full transcript. Upstream keeps the historical
+        # fallback-placeholder behavior behind False.
+        self.abort_on_summary_failure = abort_on_summary_failure
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -478,6 +484,9 @@ class ContextCompressor(ContextEngine):
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
+        # Set when summary generation fails and compression is aborted without
+        # dropping any transcript messages.
+        self._last_compress_aborted: bool = False
         # When a user-configured summary model fails and we recover by
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
@@ -1371,7 +1380,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
+    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -1389,6 +1398,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 provided, the summariser will prioritise preserving information
                 related to this topic and be more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
+            force: Clear any active summary-failure cooldown before running.
+                Manual ``/compress`` uses this so users can retry immediately.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
@@ -1397,7 +1408,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._last_compress_aborted = False
+
+        if force and self._summary_failure_cooldown_until > 0.0:
+            self._summary_failure_cooldown_until = 0.0
         n_messages = len(messages)
+        original_messages = messages
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
         if n_messages <= _min_for_compress:
@@ -1471,6 +1487,23 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         # Phase 3: Generate structured summary
         summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+
+        # If summary generation failed, preserve the transcript when configured
+        # to fail closed. This keeps the upstream v0.14 boundary/tool cleanup
+        # path intact for successful summaries while avoiding context loss when
+        # the summary model is unavailable.
+        if not summary and self.abort_on_summary_failure:
+            n_skipped = compress_end - compress_start
+            self._last_summary_dropped_count = 0
+            self._last_summary_fallback_used = False
+            self._last_compress_aborted = True
+            if not self.quiet_mode:
+                logger.warning(
+                    "Summary generation failed — aborting compression. "
+                    "%d message(s) preserved unchanged.",
+                    n_skipped,
+                )
+            return original_messages
 
         # Phase 4: Assemble compressed message list
         compressed = []
