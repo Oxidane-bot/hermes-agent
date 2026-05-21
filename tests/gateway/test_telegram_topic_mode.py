@@ -449,6 +449,86 @@ async def test_new_inside_telegram_topic_rewrites_binding_to_new_session(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_compression_rotation_rebinds_topic_to_child_session(tmp_path, monkeypatch):
+    """Compression session rotation must update the persisted Telegram topic binding."""
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="old-topic-session",
+        source="telegram",
+        user_id="208214988",
+    )
+    session_db.create_session(
+        session_id="compressed-child-session",
+        source="telegram",
+        user_id="208214988",
+        parent_session_id="old-topic-session",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="old-topic-session",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    runner._release_running_agent_state = MagicMock(
+        side_effect=lambda session_key: (
+            runner._running_agents.pop(session_key, None),
+            runner._running_agents_ts.pop(session_key, None),
+            runner._busy_ack_ts.pop(session_key, None),
+        )
+    )
+    seen_session_ids = []
+
+    async def fake_run_agent(*args, **kwargs):
+        seen_session_ids.append(kwargs.get("session_id"))
+        return {
+            "success": True,
+            "final_response": "compressed response",
+            "session_id": "compressed-child-session",
+            "messages": [],
+        }
+
+    runner._run_agent = AsyncMock(side_effect=fake_run_agent)
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    first = await runner._handle_message(
+        MessageEvent(
+            text="continue topic",
+            source=_make_source(thread_id="17585"),
+            message_id="m1",
+        )
+    )
+    second = await runner._handle_message(
+        MessageEvent(
+            text="continue again",
+            source=_make_source(thread_id="17585"),
+            message_id="m2",
+        )
+    )
+
+    assert first == "compressed response"
+    assert second == "compressed response"
+    assert seen_session_ids == ["old-topic-session", "compressed-child-session"]
+
+    binding = session_db.get_telegram_topic_binding(
+        chat_id="208214988",
+        thread_id="17585",
+    )
+    assert binding is not None
+    assert binding["session_id"] == "compressed-child-session"
+
+
+@pytest.mark.asyncio
 async def test_topic_root_command_explicitly_migrates_and_enables_topic_mode(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
@@ -1048,7 +1128,4 @@ async def test_topic_refuses_unauthorized_user(tmp_path, monkeypatch):
         ).fetchall()
     }
     assert tables == set()
-
-
-
 

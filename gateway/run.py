@@ -7806,6 +7806,11 @@ class GatewayRunner:
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
+                if self._is_telegram_topic_lane(source):
+                    try:
+                        self._record_telegram_topic_binding(source, session_entry)
+                    except Exception:
+                        logger.debug("Failed to rebind Telegram topic after compression", exc_info=True)
 
             # Prepend reasoning/thinking if display is enabled (per-platform)
             try:
