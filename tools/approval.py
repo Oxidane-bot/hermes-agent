@@ -863,6 +863,57 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def _smart_approval_attempts() -> list[tuple[Optional[str], Optional[str]]]:
+    """Return configured approval review targets in order.
+
+    ``auxiliary.approval`` supports a narrow per-task chain so smart approvals
+    can try a primary reviewer and one or more same-provider backups without
+    falling through the global auxiliary auto-detection chain. String entries in
+    ``fallback_models`` reuse the primary provider; dict entries may override
+    both provider and model.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        config = {}
+
+    auxiliary = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+    approval = auxiliary.get("approval", {}) if isinstance(auxiliary, dict) else {}
+    approval = approval if isinstance(approval, dict) else {}
+
+    provider = str(approval.get("provider", "")).strip() or None
+    model = str(approval.get("model", "")).strip() or None
+    attempts: list[tuple[Optional[str], Optional[str]]] = [(provider, model)]
+
+    raw_fallbacks = approval.get("fallback_models", [])
+    if isinstance(raw_fallbacks, (str, dict)):
+        raw_fallbacks = [raw_fallbacks]
+    if not isinstance(raw_fallbacks, list):
+        raw_fallbacks = []
+
+    for entry in raw_fallbacks:
+        if isinstance(entry, str):
+            fallback_model = entry.strip()
+            if fallback_model:
+                attempts.append((provider, fallback_model))
+        elif isinstance(entry, dict):
+            fallback_provider = str(entry.get("provider", provider or "")).strip() or provider
+            fallback_model = str(entry.get("model", "")).strip() or None
+            if fallback_model:
+                attempts.append((fallback_provider, fallback_model))
+
+    deduped: list[tuple[Optional[str], Optional[str]]] = []
+    seen: set[tuple[Optional[str], Optional[str]]] = set()
+    for attempt in attempts:
+        if attempt in seen:
+            continue
+        seen.add(attempt)
+        deduped.append(attempt)
+    return deduped or [(None, None)]
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -889,24 +940,40 @@ Rules:
 
 Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
 
-        response = call_llm(
-            task="approval",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=16,
-        )
+        last_error: Optional[Exception] = None
+        for provider, model in _smart_approval_attempts():
+            try:
+                response = call_llm(
+                    task="approval",
+                    provider=provider,
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=16,
+                )
+            except Exception as e:
+                last_error = e
+                logger.debug(
+                    "Smart approvals: LLM call failed for %s/%s (%s), trying next reviewer",
+                    provider or "auto",
+                    model or "default",
+                    e,
+                )
+                continue
 
-        answer = (response.choices[0].message.content or "").strip().upper()
+            answer = (response.choices[0].message.content or "").strip().upper()
+            if "APPROVE" in answer:
+                return "approve"
+            elif "DENY" in answer:
+                return "deny"
+            else:
+                return "escalate"
 
-        if "APPROVE" in answer:
-            return "approve"
-        elif "DENY" in answer:
-            return "deny"
-        else:
-            return "escalate"
+        logger.debug("Smart approvals: all reviewer calls failed (%s), escalating", last_error)
+        return "escalate"
 
     except Exception as e:
-        logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
+        logger.debug("Smart approvals: LLM setup failed (%s), escalating", e)
         return "escalate"
 
 

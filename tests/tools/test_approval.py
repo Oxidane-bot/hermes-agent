@@ -33,7 +33,10 @@ class TestSmartApproval:
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]
         )
-        with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
+        with (
+            mock_patch("hermes_cli.config.load_config", return_value={}),
+            mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call,
+        ):
             result = _smart_approve("python -c \"print('hello')\"", "script execution via -c flag")
 
         assert result == "approve"
@@ -41,6 +44,59 @@ class TestSmartApproval:
         assert mock_call.call_args.kwargs["task"] == "approval"
         assert mock_call.call_args.kwargs["temperature"] == 0
         assert mock_call.call_args.kwargs["max_tokens"] == 16
+
+    def test_smart_approval_tries_configured_fallback_model(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]
+        )
+        config = {
+            "auxiliary": {
+                "approval": {
+                    "provider": "custom:test-provider",
+                    "model": "gpt-5.5",
+                    "fallback_models": ["gpt-5.4"],
+                }
+            }
+        }
+
+        with (
+            mock_patch("hermes_cli.config.load_config", return_value=config),
+            mock_patch(
+                "agent.auxiliary_client.call_llm",
+                side_effect=[RuntimeError("primary unavailable"), response],
+            ) as mock_call,
+        ):
+            result = _smart_approve("python -c \"print('hello')\"", "script execution via -c flag")
+
+        assert result == "approve"
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[0].kwargs["provider"] == "custom:test-provider"
+        assert mock_call.call_args_list[0].kwargs["model"] == "gpt-5.5"
+        assert mock_call.call_args_list[1].kwargs["provider"] == "custom:test-provider"
+        assert mock_call.call_args_list[1].kwargs["model"] == "gpt-5.4"
+
+    def test_smart_approval_escalates_after_configured_models_fail(self):
+        config = {
+            "auxiliary": {
+                "approval": {
+                    "provider": "custom:test-provider",
+                    "model": "gpt-5.5",
+                    "fallback_models": ["gpt-5.4"],
+                }
+            }
+        }
+
+        with (
+            mock_patch("hermes_cli.config.load_config", return_value=config),
+            mock_patch(
+                "agent.auxiliary_client.call_llm",
+                side_effect=[RuntimeError("primary unavailable"), RuntimeError("backup unavailable")],
+            ) as mock_call,
+        ):
+            result = _smart_approve("python -c \"print('hello')\"", "script execution via -c flag")
+
+        assert result == "escalate"
+        assert mock_call.call_count == 2
 
 
 class TestDetectDangerousRm:
