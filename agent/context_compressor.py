@@ -518,6 +518,7 @@ class ContextCompressor(ContextEngine):
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
         summary_model_override: str = None,
+        summary_fallback_models: Optional[List[str]] = None,
         base_url: str = "",
         api_key: str = "",
         config_context_length: int | None = None,
@@ -579,6 +580,11 @@ class ContextCompressor(ContextEngine):
         self.last_completion_tokens = 0
 
         self.summary_model = summary_model_override or ""
+        self.summary_fallback_models = [
+            str(m).strip()
+            for m in (summary_fallback_models or [])
+            if str(m).strip()
+        ]
 
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
@@ -921,10 +927,24 @@ class ContextCompressor(ContextEngine):
         return text
 
     def _prepare_messages_for_summary_request(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Copy, redact, and truncate messages while preserving conversation layout."""
+        """Copy, redact, and truncate messages while preserving conversation layout.
+
+        System messages are preserved verbatim (no truncation) so the
+        Codex Responses adapter extracts the same ``instructions`` string the
+        main agent uses — keeping the prompt-cache prefix stable across main
+        and compression requests.  See V2 compaction scheme docs.
+        """
         prepared: List[Dict[str, Any]] = []
         for msg in messages:
             copied = msg.copy()
+            if copied.get("role") == "system":
+                # Preserve verbatim — truncating breaks Codex prompt cache parity
+                # with the main agent and forces a full re-prefill (~2x cost,
+                # ~5x latency on long conversations).  Redaction of system
+                # prompts is not needed: they come from the user's own config
+                # files, not from runtime LLM output.
+                prepared.append(copied)
+                continue
             content = copied.get("content")
             if isinstance(content, str) or content is None:
                 copied["content"] = self._redact_and_truncate_summary_text(
@@ -1125,9 +1145,84 @@ Write only the summary body. Start at "## Active Task"; do not include any pream
                 "max_tokens": int(summary_budget * 1.3),
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
+            # Transient-retry loop.  `call_llm` itself has no retry for
+            # `provider != "auto"` — when the user pins an explicit provider
+            # (e.g. `custom:primary-provider`), a single connection blip during a high
+            # peak makes the whole compaction lose the middle turns.  Retry
+            # connection/timeout/stream-closed errors a few times with a
+            # short backoff before trying configured fallback compression
+            # models, then letting the outer ``except`` enter cooldown.  See
+            # incident 2026-05-26 17:21 where one transient 502 from
+            # llm.example.club lost ~527 messages of context.
+            _max_transient_attempts = 3
+            _backoff_seconds = (3.0, 8.0)  # between attempt 1->2 and 2->3
+            _model_candidates: List[Optional[str]] = []
             if self.summary_model:
-                call_kwargs["model"] = self.summary_model
-            response = call_llm(**call_kwargs)
+                _model_candidates.append(self.summary_model)
+            else:
+                # None means: let call_llm resolve auxiliary.compression.model
+                # from config.yaml.  This preserves today's configured primary
+                # compression model (e.g. gpt-5.5) while still allowing a
+                # model override for fallback attempts below.
+                _model_candidates.append(None)
+            for _fallback_model in self.summary_fallback_models:
+                if _fallback_model not in _model_candidates:
+                    _model_candidates.append(_fallback_model)
+
+            response = None
+            _last_transient_err: Optional[Exception] = None
+            for _model_idx, _model_override in enumerate(_model_candidates):
+                _attempt_kwargs = dict(call_kwargs)
+                if _model_override:
+                    _attempt_kwargs["model"] = _model_override
+                for _attempt in range(_max_transient_attempts):
+                    try:
+                        response = call_llm(**_attempt_kwargs)
+                        break
+                    except Exception as _inner:
+                        # Only retry truly transient errors.  Anything else
+                        # (auth, 400, JSON decode, model_not_found) should
+                        # bubble to the outer except for its richer fallback
+                        # logic.
+                        _inner_status = getattr(_inner, "status_code", None) or getattr(
+                            getattr(_inner, "response", None), "status_code", None,
+                        )
+                        _inner_str = str(_inner).lower()
+                        _is_transient = (
+                            _is_connection_error(_inner)
+                            or _inner_status in {408, 429, 502, 503, 504}
+                            or "timeout" in _inner_str
+                        )
+                        if not _is_transient:
+                            raise
+                        _last_transient_err = _inner
+                        if _attempt == _max_transient_attempts - 1:
+                            break
+                        _sleep = _backoff_seconds[min(_attempt, len(_backoff_seconds) - 1)]
+                        logger.warning(
+                            "Context compression: transient error on attempt %d/%d "
+                            "for %s (%s: %s); retrying in %.1fs",
+                            _attempt + 1, _max_transient_attempts,
+                            _model_override or "configured compression model",
+                            type(_inner).__name__,
+                            str(_inner)[:160],
+                            _sleep,
+                        )
+                        time.sleep(_sleep)
+                if response is not None:
+                    break
+                if _model_idx < len(_model_candidates) - 1:
+                    _next_model = _model_candidates[_model_idx + 1]
+                    logger.warning(
+                        "Context compression: %s failed after %d transient "
+                        "attempts; trying fallback model %s",
+                        _model_override or "configured compression model",
+                        _max_transient_attempts,
+                        _next_model or "configured compression model",
+                    )
+            if response is None:
+                assert _last_transient_err is not None
+                raise _last_transient_err
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):

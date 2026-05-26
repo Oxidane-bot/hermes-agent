@@ -1248,8 +1248,18 @@ def init_agent(
         _aux_cfg = cfg_get(_agent_cfg, "auxiliary", "compression", default={})
     except Exception:
         _aux_cfg = {}
+    _aux_compression_fallback_models = []
     if isinstance(_aux_cfg, dict):
         _aux_context_config = _aux_cfg.get("context_length")
+        _raw_fallback_models = _aux_cfg.get("fallback_models", [])
+        if isinstance(_raw_fallback_models, str):
+            _aux_compression_fallback_models = [
+                m.strip() for m in _raw_fallback_models.split(",") if m.strip()
+            ]
+        elif isinstance(_raw_fallback_models, (list, tuple)):
+            _aux_compression_fallback_models = [
+                str(m).strip() for m in _raw_fallback_models if str(m).strip()
+            ]
     else:
         _aux_context_config = None
     if _aux_context_config is not None:
@@ -1450,6 +1460,7 @@ def init_agent(
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,
             summary_model_override=None,
+            summary_fallback_models=_aux_compression_fallback_models,
             quiet_mode=agent.quiet_mode,
             base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""),

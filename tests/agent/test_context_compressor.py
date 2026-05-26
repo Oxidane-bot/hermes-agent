@@ -191,6 +191,24 @@ class TestNonStringContent:
         assert summary is not None
         assert summary == SUMMARY_PREFIX
 
+    def test_summary_request_preserves_system_prompt_verbatim_but_truncates_user(self):
+        """Long system prompts must keep the same instruction prefix for prompt caching."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        system_prompt = "S" * 21359
+        user_text = "U" * 9000
+
+        prepared = c._prepare_messages_for_summary_request([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ])
+
+        assert prepared[0]["content"] == system_prompt
+        assert len(prepared[0]["content"]) == 21359
+        assert len(prepared[1]["content"]) == 5519
+        assert "...[truncated]..." in prepared[1]["content"]
+
     def test_summary_call_does_not_force_temperature(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -328,6 +346,96 @@ class TestSummaryFailureCooldown:
         assert first is None
         assert second is None
         assert mock_call.call_count == 1
+
+    def test_transient_summary_error_retries_and_succeeds_on_third_attempt(self):
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[
+                ConnectionError("upstream 502"),
+                ConnectionError("connection reset"),
+                mock_ok,
+            ],
+        ) as mock_call, patch(
+            "agent.context_compressor._is_connection_error",
+            return_value=True,
+        ), patch("agent.context_compressor.time.sleep") as mock_sleep:
+            result = c._generate_summary([{"role": "user", "content": "hello"}])
+
+        assert mock_call.call_count == 3
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [3.0, 8.0]
+        assert result is not None
+        assert "summary ok" in result
+        assert c._summary_failure_cooldown_until == 0.0
+
+    def test_transient_summary_error_exhaustion_enters_short_cooldown(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[
+                ConnectionError("upstream 502"),
+                ConnectionError("upstream 502"),
+                ConnectionError("upstream 502"),
+            ],
+        ) as mock_call, patch(
+            "agent.context_compressor._is_connection_error",
+            return_value=True,
+        ), patch("agent.context_compressor.time.sleep") as mock_sleep, patch(
+            "agent.context_compressor.time.monotonic",
+            return_value=1000.0,
+        ):
+            result = c._generate_summary([{"role": "user", "content": "hello"}])
+
+        assert result is None
+        assert mock_call.call_count == 3
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [3.0, 8.0]
+        assert c._summary_failure_cooldown_until == 1030.0
+
+    def test_transient_summary_error_uses_configured_fallback_model_after_retries(self):
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary via fallback model"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                summary_fallback_models=["gpt-5.4"],
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[
+                ConnectionError("upstream 502"),
+                ConnectionError("upstream 502"),
+                ConnectionError("upstream 502"),
+                mock_ok,
+            ],
+        ) as mock_call, patch(
+            "agent.context_compressor._is_connection_error",
+            return_value=True,
+        ), patch("agent.context_compressor.time.sleep") as mock_sleep:
+            result = c._generate_summary([{"role": "user", "content": "hello"}])
+
+        assert result is not None
+        assert "summary via fallback model" in result
+        assert mock_call.call_count == 4
+        assert [call.kwargs.get("model") for call in mock_call.call_args_list] == [
+            None,
+            None,
+            None,
+            "gpt-5.4",
+        ]
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [3.0, 8.0]
+        assert c._summary_failure_cooldown_until == 0.0
 
 
 class TestSummaryFallbackToMainModel:
@@ -581,12 +689,11 @@ class TestStreamingClosedFallback:
             {"role": "assistant", "content": "ok"},
         ]
 
-    def test_incomplete_chunked_read_falls_back_to_main(self):
-        """``httpcore.RemoteProtocolError: incomplete chunked read`` triggers
-        the retry-on-main path when ``_is_connection_error`` returns True."""
+    def test_incomplete_chunked_read_retries_summary_model_before_fallback(self):
+        """Transient stream errors retry the same summary model before fallback logic runs."""
         mock_ok = MagicMock()
         mock_ok.choices = [MagicMock()]
-        mock_ok.choices[0].message.content = "summary via main model"
+        mock_ok.choices[0].message.content = "summary via summary model"
 
         err = Exception("RemoteProtocolError: incomplete chunked read")
 
@@ -603,14 +710,48 @@ class TestStreamingClosedFallback:
         ) as mock_call, patch(
             "agent.context_compressor._is_connection_error",
             return_value=True,
-        ):
+        ), patch("agent.context_compressor.time.sleep") as mock_sleep:
             result = c._generate_summary(self._msgs())
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-stream-model"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs.get("model") == "aux-stream-model"
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [3.0]
         assert result is not None
-        assert "summary via main model" in result
+        assert "summary via summary model" in result
+
+    def test_stream_read_error_retries_summary_model(self):
+        """PRIMARY_PROVIDER-style stream_read_error is transient and should retry before cooldown."""
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary after stream retry"
+
+        err = Exception("stream_read_error")
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="aux-stream-model",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[err, err, mock_ok],
+        ) as mock_call, patch("agent.context_compressor.time.sleep") as mock_sleep:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 3
+        assert [call.kwargs.get("model") for call in mock_call.call_args_list] == [
+            "aux-stream-model",
+            "aux-stream-model",
+            "aux-stream-model",
+        ]
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [3.0, 8.0]
+        assert c._last_summary_error is None
+        assert c._summary_failure_cooldown_until == 0.0
+        assert result is not None
+        assert "summary after stream retry" in result
 
     def test_peer_closed_connection_falls_back_to_main(self):
         """``peer closed connection`` triggers the retry-on-main path."""
