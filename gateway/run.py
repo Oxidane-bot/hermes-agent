@@ -7956,13 +7956,13 @@ class GatewayRunner:
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
-        # Declare at outer scope so the audio-file-paths handling block below
-        # remains safe when ``event.media_urls`` is empty (no inner block runs).
+        # Declare at outer scope so later handling remains safe when
+        # ``event.media_urls`` is empty (no inner block runs).
+        image_paths: list[str] = []
+        audio_paths: list[str] = []
         audio_file_paths: list[str] = []
 
         if event.media_urls:
-            image_paths = []
-            audio_paths = []
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
@@ -8051,6 +8051,32 @@ class GatewayRunner:
                     f"Ask the user what they'd like you to do with it, or pass the path to a transcription or media tool.]"
                 )
                 message_text = f"{_note}\n\n{message_text}"
+
+        if audio_paths:
+            try:
+                _voice_prefix = "[The user sent a voice message~ Here's what they said: \""
+                _voice_suffix = '\"]'
+                _voice_parts = []
+                for _part in message_text.split("\n\n"):
+                    if _part.startswith(_voice_prefix) and _part.endswith(_voice_suffix):
+                        _voice_parts.append(_part[len(_voice_prefix):-len(_voice_suffix)])
+                if _voice_parts:
+                    from tools import clarify_gateway as _clarify_mod
+                    _pending_clarify = _clarify_mod.get_pending_for_session(session_key)
+                    if _pending_clarify is not None:
+                        _raw_clarify_reply = "\n\n".join(_voice_parts).strip()
+                        if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
+                            _resolved = _clarify_mod.resolve_gateway_clarify(
+                                _pending_clarify.clarify_id, _raw_clarify_reply,
+                            )
+                            if _resolved:
+                                logger.info(
+                                    "Gateway intercepted clarify voice response (session=%s, id=%s)",
+                                    session_key, _pending_clarify.clarify_id,
+                                )
+                                return ""
+            except Exception:
+                pass
 
         if event.media_urls and event.message_type == MessageType.DOCUMENT:
             import mimetypes as _mimetypes
