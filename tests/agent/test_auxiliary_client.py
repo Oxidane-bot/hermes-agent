@@ -1957,6 +1957,140 @@ class TestCodexAdapterReasoningTranslation:
         assert "reasoning" not in captured
         assert "include" not in captured
 
+    def test_replays_canonical_responses_items_for_checkpoint_compaction(self):
+        """Codex auxiliary compaction should use the same Responses replay
+        shape as the main agent instead of flattening prior turns.
+
+        This is the V2 checkpoint-compaction contract: assistant response
+        items, encrypted reasoning, function calls, and tool outputs are
+        forwarded as Responses input items so the provider can reuse the
+        stored/prefix structure of the original conversation.
+        """
+        adapter, captured = self._build_adapter()
+
+        adapter.create(
+            messages=[
+                {"role": "system", "content": "SYSTEM PROMPT"},
+                {"role": "user", "content": "original request"},
+                {
+                    "role": "assistant",
+                    "content": "visible fallback",
+                    "codex_reasoning_items": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_keep_self_contained_blob",
+                            "encrypted_content": "encrypted-reasoning",
+                        }
+                    ],
+                    "codex_message_items": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "id": "msg_replay",
+                            "phase": "final_answer",
+                            "content": [
+                                {"type": "output_text", "text": "assistant reply"}
+                            ],
+                        }
+                    ],
+                    "tool_calls": [
+                        {
+                            "call_id": "call_lookup",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"path": "README.md"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_lookup",
+                    "content": "lookup result",
+                },
+                {"role": "user", "content": "checkpoint instruction"},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+        assert captured["instructions"] == "SYSTEM PROMPT"
+        input_items = captured["input"]
+        assert {
+            "type": "reasoning",
+            "encrypted_content": "encrypted-reasoning",
+        } in input_items
+        assert {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "assistant reply"}],
+            "id": "msg_replay",
+            "phase": "final_answer",
+        } in input_items
+        assert {
+            "type": "function_call",
+            "call_id": "call_lookup",
+            "name": "lookup",
+            "arguments": '{"path": "README.md"}',
+        } in input_items
+        assert {
+            "type": "function_call_output",
+            "call_id": "call_lookup",
+            "output": "lookup result",
+        } in input_items
+        assert not any(item.get("role") == "tool" for item in input_items)
+        assert captured["tools"] == [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Read a file",
+                "strict": False,
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+    def test_xai_responses_adapter_strips_replayed_encrypted_reasoning(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        adapter, captured = self._build_adapter()
+        adapter = _CodexCompletionsAdapter(
+            adapter._client,
+            "grok-4",
+            is_xai_responses=True,
+        )
+
+        adapter.create(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "visible",
+                    "codex_reasoning_items": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_xai_rejects_this",
+                            "encrypted_content": "xai-should-not-see-this",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "next"},
+            ]
+        )
+
+        assert not any(
+            item.get("encrypted_content") == "xai-should-not-see-this"
+            for item in captured["input"]
+        )
+
     def test_extra_body_without_reasoning_key_is_noop(self):
         adapter, captured = self._build_adapter()
         adapter.create(

@@ -578,86 +578,56 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
 # calls to the Codex Responses API so callers don't need any changes.
 
 
-def _convert_content_for_responses(content: Any) -> Any:
-    """Convert chat.completions content to Responses API format.
-
-    chat.completions uses:
-      {"type": "text", "text": "..."}
-      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
-
-    Responses API uses:
-      {"type": "input_text", "text": "..."}
-      {"type": "input_image", "image_url": "data:image/png;base64,..."}
-
-    If content is a plain string, it's returned as-is (the Responses API
-    accepts strings directly for text-only messages).
-    """
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return str(content) if content else ""
-
-    converted: List[Dict[str, Any]] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type", "")
-        if ptype == "text":
-            converted.append({"type": "input_text", "text": part.get("text", "")})
-        elif ptype == "image_url":
-            # chat.completions nests the URL: {"image_url": {"url": "..."}}
-            image_data = part.get("image_url", {})
-            url = image_data.get("url", "") if isinstance(image_data, dict) else str(image_data)
-            entry: Dict[str, Any] = {"type": "input_image", "image_url": url}
-            # Preserve detail if specified
-            detail = image_data.get("detail") if isinstance(image_data, dict) else None
-            if detail:
-                entry["detail"] = detail
-            converted.append(entry)
-        elif ptype in {"input_text", "input_image"}:
-            # Already in Responses format — pass through
-            converted.append(part)
-        else:
-            # Unknown content type — try to preserve as text
-            text = part.get("text", "")
-            if text:
-                converted.append({"type": "input_text", "text": text})
-
-    return converted or ""
-
-
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
 
-    def __init__(self, real_client: OpenAI, model: str):
+    def __init__(
+        self,
+        real_client: OpenAI,
+        model: str,
+        *,
+        is_xai_responses: bool = False,
+    ):
         self._client = real_client
         self._model = model
+        self._is_xai_responses = is_xai_responses
 
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
-        # Separate system/instructions from conversation messages.
-        # Convert chat.completions multimodal content blocks to Responses
-        # API format (input_text / input_image instead of text / image_url).
+        # Build the same Responses input replay shape used by the main Codex
+        # transport.  Context compression is intentionally framed as another
+        # normal checkpoint turn over the existing conversation, not as a
+        # flattened blob of transcript text.  Reusing the canonical converter
+        # preserves assistant response items, encrypted reasoning, phases, and
+        # function_call/function_call_output items so auxiliary compaction can
+        # benefit from the same prefix/storage behavior as the main chat path.
+        from agent.codex_responses_adapter import (
+            _chat_messages_to_responses_input,
+            _responses_tools,
+        )
+
         instructions = "You are a helpful assistant."
-        input_msgs: List[Dict[str, Any]] = []
+        payload_messages: List[Dict[str, Any]] = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
             if role == "system":
                 instructions = content if isinstance(content, str) else str(content)
             else:
-                input_msgs.append({
-                    "role": role,
-                    "content": _convert_content_for_responses(content),
-                })
+                payload_messages.append(msg)
+
+        input_items = _chat_messages_to_responses_input(
+            payload_messages,
+            is_xai_responses=self._is_xai_responses,
+        )
 
         resp_kwargs: Dict[str, Any] = {
             "model": model,
             "instructions": instructions,
-            "input": input_msgs or [{"role": "user", "content": ""}],
+            "input": input_items or [{"role": "user", "content": ""}],
             "store": False,
         }
 
@@ -704,23 +674,13 @@ class _CodexCompletionsAdapter:
                     }
                     resp_kwargs["include"] = ["reasoning.encrypted_content"]
 
-        # Tools support for auxiliary callers (e.g. skills_hub) that pass function schemas
+        # Tools support for auxiliary callers (e.g. skills_hub) that pass
+        # function schemas. Use the canonical Responses converter so auxiliary
+        # calls stay byte-for-byte closer to the main transport.
         tools = kwargs.get("tools")
-        if tools:
-            converted = []
-            for t in tools:
-                fn = t.get("function", {}) if isinstance(t, dict) else {}
-                name = fn.get("name")
-                if not name:
-                    continue
-                converted.append({
-                    "type": "function",
-                    "name": name,
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                })
-            if converted:
-                resp_kwargs["tools"] = converted
+        converted_tools = _responses_tools(tools)
+        if converted_tools:
+            resp_kwargs["tools"] = converted_tools
 
         # Stream and collect the response
         text_parts: List[str] = []
@@ -896,9 +856,19 @@ class CodexAuxiliaryClient:
     Also exposes .api_key and .base_url for introspection by async wrappers.
     """
 
-    def __init__(self, real_client: OpenAI, model: str):
+    def __init__(
+        self,
+        real_client: OpenAI,
+        model: str,
+        *,
+        is_xai_responses: bool = False,
+    ):
         self._real_client = real_client
-        adapter = _CodexCompletionsAdapter(real_client, model)
+        adapter = _CodexCompletionsAdapter(
+            real_client,
+            model,
+            is_xai_responses=is_xai_responses,
+        )
         self.chat = _CodexChatShim(adapter)
         self.api_key = real_client.api_key
         self.base_url = real_client.base_url
@@ -1838,7 +1808,7 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
     api_key, base_url = resolved
     logger.debug("Auxiliary client: xAI OAuth (%s via Responses API)", model)
     real_client = OpenAI(api_key=api_key, base_url=base_url)
-    return CodexAuxiliaryClient(real_client, model), model
+    return CodexAuxiliaryClient(real_client, model, is_xai_responses=True), model
 
 
 def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
