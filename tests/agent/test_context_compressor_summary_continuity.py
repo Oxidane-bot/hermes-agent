@@ -45,11 +45,12 @@ def test_existing_previous_summary_is_not_serialized_again_as_new_turn():
     with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call:
         compressor.compress(_messages_with_handoff(old_summary))
 
-    prompt = mock_call.call_args.kwargs["messages"][0]["content"]
-    assert "PREVIOUS SUMMARY:" in prompt
-    assert "NEW TURNS TO INCORPORATE:" in prompt
-    assert prompt.count(old_summary) == 1
-    assert f"[USER]: {SUMMARY_PREFIX}" not in prompt
+    summary_messages = mock_call.call_args.kwargs["messages"]
+    checkpoint = summary_messages[-1]["content"]
+    combined = "\n".join(str(m.get("content", "")) for m in summary_messages)
+    assert "PREVIOUS SUMMARY BODY TO INCORPORATE IF STILL RELEVANT:" in checkpoint
+    assert checkpoint.count(old_summary) == 1
+    assert f"[USER]: {SUMMARY_PREFIX}" not in combined
 
 
 def test_resume_rehydrates_previous_summary_from_handoff_message():
@@ -61,12 +62,13 @@ def test_resume_rehydrates_previous_summary_from_handoff_message():
     with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call:
         compressor.compress(_messages_with_handoff(old_summary))
 
-    prompt = mock_call.call_args.kwargs["messages"][0]["content"]
-    assert "PREVIOUS SUMMARY:" in prompt
-    assert "NEW TURNS TO INCORPORATE:" in prompt
-    assert "TURNS TO SUMMARIZE:" not in prompt
-    assert prompt.count(old_summary) == 1
-    assert f"[USER]: {SUMMARY_PREFIX}" not in prompt
+    summary_messages = mock_call.call_args.kwargs["messages"]
+    checkpoint = summary_messages[-1]["content"]
+    combined = "\n".join(str(m.get("content", "")) for m in summary_messages)
+    assert "PREVIOUS SUMMARY BODY TO INCORPORATE IF STILL RELEVANT:" in checkpoint
+    assert "TURNS TO SUMMARIZE:" not in checkpoint
+    assert checkpoint.count(old_summary) == 1
+    assert f"[USER]: {SUMMARY_PREFIX}" not in combined
 
 
 def test_handoff_in_protected_head_populates_previous_summary_before_update():
@@ -85,3 +87,4 @@ def test_handoff_in_protected_head_populates_previous_summary_before_update():
     assert compressor._previous_summary == old_summary
     assert seen_turns
     assert all(old_summary not in str(msg.get("content", "")) for msg in seen_turns)
+

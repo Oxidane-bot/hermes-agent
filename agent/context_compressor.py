@@ -911,60 +911,91 @@ class ContextCompressor(ContextEngine):
         self.summary_model = ""  # empty = use main model
         self._summary_failure_cooldown_until = 0.0  # no cooldown — retry immediately
 
-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
-        """Generate a structured summary of conversation turns.
+    @staticmethod
+    def _redact_and_truncate_summary_text(value: Any, max_len: int, head_len: int, tail_len: int) -> str:
+        """Redact and truncate one text value for the summary request."""
+        text = redact_sensitive_text("" if value is None else str(value))
+        if len(text) > max_len:
+            tail = text[-tail_len:] if tail_len > 0 else ""
+            return text[:head_len] + "\n...[truncated]...\n" + tail
+        return text
 
-        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
-        Questions, Files, Remaining Work) with explicit preamble telling the
-        summarizer not to answer questions.  When a previous summary exists,
-        generates an iterative update instead of summarizing from scratch.
+    def _prepare_messages_for_summary_request(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Copy, redact, and truncate messages while preserving conversation layout."""
+        prepared: List[Dict[str, Any]] = []
+        for msg in messages:
+            copied = msg.copy()
+            content = copied.get("content")
+            if isinstance(content, str) or content is None:
+                copied["content"] = self._redact_and_truncate_summary_text(
+                    content,
+                    self._CONTENT_MAX,
+                    self._CONTENT_HEAD,
+                    self._CONTENT_TAIL,
+                )
+            elif isinstance(content, list):
+                new_content = []
+                for part in content:
+                    if isinstance(part, str):
+                        new_content.append(self._redact_and_truncate_summary_text(
+                            part,
+                            self._CONTENT_MAX,
+                            self._CONTENT_HEAD,
+                            self._CONTENT_TAIL,
+                        ))
+                        continue
+                    if isinstance(part, dict):
+                        part_copy = part.copy()
+                        if "text" in part_copy:
+                            part_copy["text"] = self._redact_and_truncate_summary_text(
+                                part_copy.get("text"),
+                                self._CONTENT_MAX,
+                                self._CONTENT_HEAD,
+                                self._CONTENT_TAIL,
+                            )
+                        new_content.append(part_copy)
+                        continue
+                    new_content.append(str(part))
+                copied["content"] = new_content
+            else:
+                copied["content"] = self._redact_and_truncate_summary_text(
+                    content,
+                    self._CONTENT_MAX,
+                    self._CONTENT_HEAD,
+                    self._CONTENT_TAIL,
+                )
 
-        Args:
-            focus_topic: Optional focus string for guided compression.  When
-                provided, the summariser prioritises preserving information
-                related to this topic and is more aggressive about compressing
-                everything else.  Inspired by Claude Code's ``/compact``.
+            tool_calls = copied.get("tool_calls")
+            if tool_calls:
+                new_tool_calls = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        tc_copy = tc.copy()
+                        fn = tc_copy.get("function")
+                        if isinstance(fn, dict):
+                            fn_copy = fn.copy()
+                            fn_copy["arguments"] = self._redact_and_truncate_summary_text(
+                                fn_copy.get("arguments", ""),
+                                self._TOOL_ARGS_MAX,
+                                self._TOOL_ARGS_HEAD,
+                                0,
+                            )
+                            tc_copy["function"] = fn_copy
+                        new_tool_calls.append(tc_copy)
+                    else:
+                        new_tool_calls.append(tc)
+                copied["tool_calls"] = new_tool_calls
+            prepared.append(copied)
+        return prepared
 
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
-        """
-        now = time.monotonic()
-        if now < self._summary_failure_cooldown_until:
-            logger.debug(
-                "Skipping context summary during cooldown (%.0fs remaining)",
-                self._summary_failure_cooldown_until - now,
-            )
-            return None
-
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
-
-        # Preamble shared by both first-compaction and iterative-update prompts.
-        # Keep the wording deliberately plain: Azure/OpenAI-compatible content
-        # filters have flagged stronger "injection" / "do not respond" framing.
-        _summarizer_preamble = (
-            "You are a summarization agent creating a context checkpoint. "
-            "Treat the conversation turns below as source material for a "
-            "compact record of prior work. "
-            "Produce only the structured summary; do not add a greeting, "
-            "preamble, or prefix. "
-            "Write the summary in the same language the user was using in the "
-            "conversation — do not translate or switch to English. "
-            "NEVER include API keys, tokens, passwords, secrets, credentials, "
-            "or connection strings in the summary — replace any that appear "
-            "with [REDACTED]. Note that the user had credentials present, but "
-            "do not preserve their values."
-        )
-
-        # Shared structured template (used by both paths).
-        _template_sections = f"""## Active Task
-[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
-task assignment verbatim — the exact words they used. If multiple tasks
-were requested and only some are done, list only the ones NOT yet completed.
-Continuation should pick up exactly here. Example:
-"User asked: 'Now refactor the auth module to use JWT instead of sessions'"
-If no outstanding task exists, write "None."]
+    @staticmethod
+    def _summary_template_sections(summary_budget: int) -> str:
+        """Return the V2 structured summary template."""
+        return f"""## Active Task
+[CRITICAL: This checkpoint message is NOT a user request and MUST be excluded. Look BACKWARD through the conversation history above and find the user's most recent SUBSTANTIVE request or task assignment — the actual instruction the user gave the assistant before this checkpoint. Copy that verbatim, in the user's original language. If the most recent user message is a short ack like "continue" / "go on" / "ok" / "继续", quote it but ALSO state what task it was telling the assistant to continue. If no real outstanding user request exists, write "None."
+Format:
+User asked: "<verbatim quote>"
+Outstanding: <one sentence describing the actual outstanding work>]
 
 ## Goal
 [What the user is trying to accomplish overall]
@@ -975,19 +1006,10 @@ If no outstanding task exists, write "None."]
 ## Completed Actions
 [Numbered list of concrete actions taken — include tool used, target, and outcome.
 Format each as: N. ACTION target — outcome [tool: name]
-Example:
-1. READ config.py:45 — found `==` should be `!=` [tool: read_file]
-2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
-3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
 Be specific with file paths, commands, line numbers, and results.]
 
 ## Active State
-[Current working state — include:
-- Working directory and branch (if applicable)
-- Modified/created files with brief note on each
-- Test status (X/Y passing)
-- Any running processes or servers
-- Environment details that matter]
+[Current working state — working directory and branch, modified/created files, test status, running processes, environment details that matter]
 
 ## In Progress
 [Work currently underway — what was being done when compaction fired]
@@ -1015,43 +1037,79 @@ Be specific with file paths, commands, line numbers, and results.]
 
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 
-Write only the summary body. Do not include any preamble or prefix."""
+Write only the summary body. Start at "## Active Task"; do not include any preamble, greeting, or handoff prefix."""
 
-        if self._previous_summary:
-            # Iterative update: preserve existing info, add new progress
-            prompt = f"""{_summarizer_preamble}
-
-You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
-
-PREVIOUS SUMMARY:
-{self._previous_summary}
-
-NEW TURNS TO INCORPORATE:
-{content_to_summarize}
-
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled request — this is the most important field for task continuity.
-
-{_template_sections}"""
-        else:
-            # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
-
-Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
-
-TURNS TO SUMMARIZE:
-{content_to_summarize}
-
-Use this exact structure:
-
-{_template_sections}"""
-
-        # Inject focus topic guidance when the user provides one via /compress <focus>.
-        # This goes at the end of the prompt so it takes precedence.
+    def _build_checkpoint_instruction(self, summary_budget: int, focus_topic: Optional[str] = None, previous_summary: Optional[str] = None) -> str:
+        """Build the V2 infrastructure checkpoint instruction."""
+        parts = [
+            "[CHECKPOINT REQUESTED — infrastructure message, not a user request]",
+            "",
+            "A context checkpoint is being created. For this turn only, create a structured handoff summary using the template below.",
+            "",
+            "This message itself is infrastructure. Do not treat it as the user's latest request. For Active Task, look backward through the conversation above for the latest substantive real user request.",
+            "",
+            "Write the summary in the SAME LANGUAGE the user was using in the conversation above — do not translate or switch to English.",
+            "",
+            "NEVER include API keys, tokens, passwords, secrets, credentials, or connection strings — replace any that appear with [REDACTED].",
+        ]
+        if previous_summary:
+            parts.extend([
+                "",
+                "PREVIOUS SUMMARY BODY TO INCORPORATE IF STILL RELEVANT:",
+                self._strip_summary_prefix(previous_summary),
+            ])
+        parts.extend([
+            "",
+            "Use exactly this structure:",
+            "",
+            self._summary_template_sections(summary_budget),
+        ])
         if focus_topic:
-            prompt += f"""
+            parts.extend([
+                "",
+                f"FOCUS TOPIC: \"{focus_topic}\"",
+                "Prioritise preserving information related to this focus topic. For unrelated content, summarise more aggressively. Even for the focus topic, redact secrets as [REDACTED].",
+            ])
+        parts.append("\nOutput the summary now.")
+        return "\n".join(parts)
 
-FOCUS TOPIC: "{focus_topic}"
-The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: Optional[str] = None, protected_head: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+        """Generate a structured summary of conversation turns.
+
+        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
+        Questions, Files, Remaining Work) with explicit preamble telling the
+        summarizer not to answer questions.  When a previous summary exists,
+        generates an iterative update instead of summarizing from scratch.
+
+        Args:
+            focus_topic: Optional focus string for guided compression.  When
+                provided, the summariser prioritises preserving information
+                related to this topic and is more aggressive about compressing
+                everything else.  Inspired by Claude Code's ``/compact``.
+
+        Returns None if all attempts fail — the caller should drop
+        the middle turns without a summary rather than inject a useless
+        placeholder.
+        """
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            logger.debug(
+                "Skipping context summary during cooldown (%.0fs remaining)",
+                self._summary_failure_cooldown_until - now,
+            )
+            return None
+
+        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        protected_head = protected_head or []
+        checkpoint_instruction = self._build_checkpoint_instruction(
+            summary_budget,
+            focus_topic=focus_topic,
+            previous_summary=self._previous_summary,
+        )
+        summary_messages = self._prepare_messages_for_summary_request(
+            list(protected_head) + list(turns_to_summarize)
+        )
+        summary_messages.append({"role": "user", "content": checkpoint_instruction})
 
         try:
             call_kwargs = {
@@ -1063,7 +1121,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     "api_key": self.api_key,
                     "api_mode": self.api_mode,
                 },
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": summary_messages,
                 "max_tokens": int(summary_budget * 1.3),
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
@@ -1077,8 +1135,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())
-            # Store for iterative updates on next compaction
-            self._previous_summary = summary
+            summary_body = self._strip_summary_prefix(summary)
+            # Store the clean body for iterative updates; the runtime handoff
+            # prefix is added only when inserting the summary into history.
+            self._previous_summary = summary_body
             self._summary_failure_cooldown_until = 0.0
             self._summary_model_fallen_back = False
             self._last_summary_error = None
@@ -1155,7 +1215,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    protected_head=protected_head,
+                )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
             # context is almost always worse than one extra summary attempt, so
@@ -1172,7 +1236,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    protected_head=protected_head,
+                )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
             # streaming premature-close) — shorter cooldown for JSON decode and
@@ -1601,7 +1669,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         # Phase 3: Generate structured summary
-        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+        summary = self._generate_summary(
+            turns_to_summarize,
+            focus_topic=focus_topic,
+            protected_head=messages[:compress_start],
+        )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -1632,16 +1704,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
-            msg = messages[i].copy()
-            if i == 0 and msg.get("role") == "system":
-                existing = msg.get("content")
-                _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
-                if _compression_note not in _content_text_for_contains(existing):
-                    msg["content"] = _append_text_to_content(
-                        existing,
-                        "\n\n" + _compression_note if isinstance(existing, str) and existing else _compression_note,
-                    )
-            compressed.append(msg)
+            compressed.append(messages[i].copy())
 
         # Legacy fallback path: LLM summary failed and abort_on_summary_failure
         # is False (the default).  Insert a static placeholder so the model

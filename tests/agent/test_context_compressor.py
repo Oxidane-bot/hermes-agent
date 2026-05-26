@@ -87,6 +87,18 @@ class TestCompress:
         compressor.compress(msgs)
         assert compressor.compression_count == 2
 
+    def test_compression_does_not_mutate_system_prompt(self, compressor):
+        msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "## Active Task\nNone."
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = compressor.compress(msgs)
+
+        assert result[0] == {"role": "system", "content": "System prompt"}
+        assert "Some earlier conversation turns" not in result[0]["content"]
+
     def test_protects_first_and_last(self, compressor):
         msgs = self._make_messages(10)
         result = compressor.compress(msgs)
@@ -214,13 +226,18 @@ class TestNonStringContent:
         with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
             c._generate_summary(messages)
 
-        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
-        assert "Your output will be injected" not in prompt
-        assert "Do NOT respond" not in prompt
-        assert "DIFFERENT assistant" not in prompt
-        assert "different assistant" not in prompt
-        assert "Treat the conversation turns below as source material" in prompt
-        assert "structured checkpoint summary" in prompt
+        summary_messages = mock_call.call_args.kwargs["messages"]
+        checkpoint = summary_messages[-1]["content"]
+        assert "Your output will be injected" not in checkpoint
+        assert "Do NOT respond" not in checkpoint
+        assert "DIFFERENT assistant" not in checkpoint
+        assert "different assistant" not in checkpoint
+        assert checkpoint.startswith("[CHECKPOINT REQUESTED")
+        assert "infrastructure message, not a user request" in checkpoint
+        assert "Look BACKWARD" in checkpoint
+        assert "## Active Task" in checkpoint
+        assert len(summary_messages) == len(messages) + 1
+        assert summary_messages[:-1] == messages
 
     def test_summary_call_passes_live_main_runtime(self):
         mock_response = MagicMock()
@@ -252,6 +269,46 @@ class TestNonStringContent:
             "api_key": "codex-token",
             "api_mode": "codex_responses",
         }
+
+    def test_summary_request_preserves_layout_and_appends_checkpoint(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "## Active Task\nNone."
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        protected_head = [
+            {"role": "system", "content": "stable system"},
+            {"role": "user", "content": "original task"},
+        ]
+        turns = [
+            {"role": "assistant", "content": "work done"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(turns, protected_head=protected_head)
+
+        summary_messages = mock_call.call_args.kwargs["messages"]
+        assert summary_messages[:-1] == protected_head + turns
+        assert summary_messages[-1]["role"] == "user"
+        assert summary_messages[-1]["content"].startswith("[CHECKPOINT REQUESTED")
+        assert "TURNS TO SUMMARIZE:" not in summary_messages[-1]["content"]
+
+    def test_previous_summary_stored_without_runtime_prefix(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = f"{SUMMARY_PREFIX}\n## Active Task\nNone."
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c._generate_summary([{"role": "user", "content": "hello"}])
+
+        assert result == f"{SUMMARY_PREFIX}\n## Active Task\nNone."
+        assert c._previous_summary == "## Active Task\nNone."
 
 
 class TestSummaryFailureCooldown:
@@ -885,7 +942,7 @@ class TestSummaryPrefixNormalization:
 
 
 class TestCompressWithClient:
-    def test_system_content_list_gets_compression_note_without_crashing(self):
+    def test_system_content_list_is_preserved_without_compression_note(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -907,8 +964,8 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
 
-        assert isinstance(result[0]["content"], list)
-        assert any(
+        assert result[0]["content"] == [{"type": "text", "text": "system prompt"}]
+        assert not any(
             isinstance(block, dict)
             and "compacted into a handoff summary" in block.get("text", "")
             for block in result[0]["content"]
