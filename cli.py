@@ -327,6 +327,25 @@ def _parse_service_tier_config(raw: str) -> str | None:
     logger.warning("Unknown service_tier '%s', ignoring", raw)
     return None
 
+
+def _parse_anthropic_fast_mode_config(raw: object, *, legacy_service_tier: object = "") -> bool:
+    """Parse Anthropic Fast Mode preference.
+
+    ``agent.anthropic_fast_mode`` controls Anthropic ``speed=fast`` separately
+    from OpenAI/Codex Priority Processing. When the new key is unset, preserve
+    the legacy behaviour by falling back to ``agent.service_tier``.
+    """
+    value = str(raw if raw is not None else "").strip().lower()
+    if value == "":
+        value = str(legacy_service_tier or "").strip().lower()
+    if not value or value in {"normal", "default", "standard", "off", "none", "false", "no", "0"}:
+        return False
+    if value in {"fast", "priority", "on", "true", "yes", "1"}:
+        return True
+    logger.warning("Unknown anthropic_fast_mode '%s', ignoring", raw)
+    return False
+
+
 def load_cli_config() -> Dict[str, Any]:
     """
     Load CLI configuration from config files.
@@ -394,6 +413,7 @@ def load_cli_config() -> Dict[str, Any]:
             "prefill_messages_file": "",
             "reasoning_effort": "",
             "service_tier": "",
+            "anthropic_fast_mode": "",
             "personalities": {
                 "helpful": "You are a helpful, friendly AI assistant.",
                 "concise": "You are a concise assistant. Keep responses brief and to the point.",
@@ -3111,7 +3131,11 @@ class HermesCLI:
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
-        
+        self.anthropic_fast_mode = _parse_anthropic_fast_mode_config(
+            CLI_CONFIG["agent"].get("anthropic_fast_mode", ""),
+            legacy_service_tier=CLI_CONFIG["agent"].get("service_tier", ""),
+        )
+
         # OpenRouter provider routing preferences
         pr = CLI_CONFIG.get("provider_routing", {}) or {}
         self._provider_sort = pr.get("sort")
@@ -4790,6 +4814,8 @@ class HermesCLI:
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
+            overrides = None
+        if overrides and "speed" in overrides and not getattr(self, "anthropic_fast_mode", False):
             overrides = None
         route["request_overrides"] = overrides
         return route

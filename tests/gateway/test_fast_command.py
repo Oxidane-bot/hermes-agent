@@ -51,6 +51,7 @@ def _make_runner():
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._service_tier = None
+    runner._anthropic_fast_mode = False
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._running_agents = {}
@@ -121,6 +122,30 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_turn_route_splits_anthropic_fast_from_priority_processing():
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    runner._anthropic_fast_mode = False
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://api.anthropic.com",
+        "provider": "anthropic",
+        "api_mode": "anthropic_messages",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "claude-opus-4-6", runtime_kwargs)
+
+    assert route["request_overrides"] == {}
+
+    runner._anthropic_fast_mode = True
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "claude-opus-4-6", runtime_kwargs)
+
+    assert route["request_overrides"] == {"speed": "fast"}
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
@@ -136,6 +161,17 @@ async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert saved["agent"]["service_tier"] == "fast"
+
+
+def test_load_anthropic_fast_mode_explicit_off_overrides_service_tier(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  service_tier: fast\n  anthropic_fast_mode: off\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    assert gateway_run.GatewayRunner._load_service_tier() == "priority"
+    assert gateway_run.GatewayRunner._load_anthropic_fast_mode() is False
 
 
 @pytest.mark.asyncio

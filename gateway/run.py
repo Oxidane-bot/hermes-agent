@@ -1695,6 +1695,7 @@ class GatewayRunner:
         self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
         self._reasoning_config = self._load_reasoning_config()
         self._service_tier = self._load_service_tier()
+        self._anthropic_fast_mode = self._load_anthropic_fast_mode()
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
@@ -2476,6 +2477,8 @@ class GatewayRunner:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
             overrides = None
+        if overrides and "speed" in overrides and not getattr(self, "_anthropic_fast_mode", False):
+            overrides = None
         route["request_overrides"] = overrides or {}
         return route
 
@@ -2925,6 +2928,36 @@ class GatewayRunner:
             return "priority"
         logger.warning("Unknown service_tier '%s', ignoring", raw)
         return None
+
+    @staticmethod
+    def _load_anthropic_fast_mode() -> bool:
+        """Load Anthropic Fast Mode separately from Codex Priority Processing.
+
+        ``agent.anthropic_fast_mode`` controls Anthropic ``speed=fast``. If the
+        key is unset, fall back to legacy ``agent.service_tier`` behaviour.
+        """
+        raw = ""
+        legacy = ""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                raw_value = cfg_get(cfg, "agent", "anthropic_fast_mode", default="")
+                legacy_value = cfg_get(cfg, "agent", "service_tier", default="")
+                raw = "" if raw_value is None else str(raw_value).strip()
+                legacy = "" if legacy_value is None else str(legacy_value).strip()
+        except Exception:
+            pass
+
+        value = raw.lower() if raw else legacy.lower()
+        if not value or value in {"normal", "default", "standard", "off", "none", "false", "no", "0"}:
+            return False
+        if value in {"fast", "priority", "on", "true", "yes", "1"}:
+            return True
+        logger.warning("Unknown anthropic_fast_mode '%s', ignoring", raw)
+        return False
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -11815,6 +11848,7 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
+            self._anthropic_fast_mode = self._load_anthropic_fast_mode()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             # Enrich the prompt with image descriptions so the background
@@ -12065,6 +12099,7 @@ class GatewayRunner:
         args = event.get_command_args().strip().lower()
         config_path = _hermes_home / "config.yaml"
         self._service_tier = self._load_service_tier()
+        self._anthropic_fast_mode = self._load_anthropic_fast_mode()
 
         user_config = _load_gateway_config()
         model = _resolve_gateway_model(user_config)
@@ -16671,6 +16706,7 @@ class GatewayRunner:
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
+            self._anthropic_fast_mode = self._load_anthropic_fast_mode()
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None

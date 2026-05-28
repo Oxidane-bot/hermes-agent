@@ -35,10 +35,29 @@ class TestParseServiceTierConfig(unittest.TestCase):
         self.assertIsNone(self._parse(""))
 
 
+class TestParseAnthropicFastModeConfig(unittest.TestCase):
+    def _parse(self, raw, legacy=""):
+        cli_mod = _import_cli()
+        return cli_mod._parse_anthropic_fast_mode_config(raw, legacy_service_tier=legacy)
+
+    def test_explicit_off_overrides_legacy_fast(self):
+        self.assertFalse(self._parse("off", legacy="fast"))
+        self.assertFalse(self._parse(False, legacy="fast"))
+
+    def test_unset_falls_back_to_legacy_service_tier(self):
+        self.assertTrue(self._parse("", legacy="fast"))
+        self.assertFalse(self._parse("", legacy="normal"))
+
+    def test_explicit_on(self):
+        self.assertTrue(self._parse("on"))
+        self.assertTrue(self._parse(True))
+
+
 class TestHandleFastCommand(unittest.TestCase):
     def _make_cli(self, service_tier=None):
         return SimpleNamespace(
             service_tier=service_tier,
+            anthropic_fast_mode=True,
             provider="openai-codex",
             requested_provider="openai-codex",
             model="gpt-5.4",
@@ -230,6 +249,7 @@ class TestFastModeRouting(unittest.TestCase):
             acp_args=[],
             _credential_pool=None,
             service_tier="priority",
+            anthropic_fast_mode=True,
         )
 
         route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
@@ -252,6 +272,7 @@ class TestFastModeRouting(unittest.TestCase):
             acp_args=[],
             _credential_pool=None,
             service_tier="priority",
+            anthropic_fast_mode=True,
         )
 
         route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
@@ -398,12 +419,32 @@ class TestAnthropicFastMode(unittest.TestCase):
             acp_args=[],
             _credential_pool=None,
             service_tier="priority",
+            anthropic_fast_mode=True,
         )
 
         route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
 
         assert route["runtime"]["provider"] == "anthropic"
         assert route["request_overrides"] == {"speed": "fast"}
+
+    def test_turn_route_suppresses_speed_when_anthropic_fast_disabled(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="claude-opus-4-6",
+            api_key="sk-ant-test",
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+            api_mode="anthropic_messages",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier="priority",
+            anthropic_fast_mode=False,
+        )
+
+        route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
+
+        assert route["request_overrides"] is None
 
 
 class TestAnthropicFastModeAdapter(unittest.TestCase):
@@ -479,3 +520,5 @@ class TestConfigDefault(unittest.TestCase):
         agent = DEFAULT_CONFIG.get("agent", {})
         self.assertIn("service_tier", agent)
         self.assertEqual(agent["service_tier"], "")
+        self.assertIn("anthropic_fast_mode", agent)
+        self.assertEqual(agent["anthropic_fast_mode"], "")
