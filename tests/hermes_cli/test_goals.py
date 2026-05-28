@@ -640,6 +640,46 @@ class TestContinuationPromptWithSubgoals:
         assert "2. update docs" in prompt
 
 
+class TestMigrateGoalSession:
+    def test_migrates_active_goal_to_compressed_session(self, hermes_home):
+        from hermes_cli.goals import GoalManager, migrate_goal_session
+
+        old_mgr = GoalManager(session_id="goal-before-compression")
+        state = old_mgr.set("finish the release pack", max_turns=20)
+        state.turns_used = 7
+        state.last_verdict = "continue"
+        state.last_reason = "still partial"
+        old_mgr.add_subgoal("produce all PDFs")
+
+        assert migrate_goal_session("goal-before-compression", "goal-after-compression")
+
+        old_reloaded = GoalManager(session_id="goal-before-compression")
+        new_reloaded = GoalManager(session_id="goal-after-compression")
+
+        assert old_reloaded.state is not None
+        assert old_reloaded.state.status == "cleared"
+        assert old_reloaded.state.last_reason == "migrated to goal-after-compression"
+
+        assert new_reloaded.state is not None
+        assert new_reloaded.state.status == "active"
+        assert new_reloaded.state.goal == "finish the release pack"
+        assert new_reloaded.state.turns_used == 7
+        assert new_reloaded.state.last_verdict == "continue"
+        assert new_reloaded.state.last_reason == "still partial"
+        assert new_reloaded.state.subgoals == ["produce all PDFs"]
+
+    def test_does_not_overwrite_existing_target_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager, migrate_goal_session
+
+        GoalManager(session_id="source-goal").set("source target")
+        GoalManager(session_id="target-goal").set("target target")
+
+        assert not migrate_goal_session("source-goal", "target-goal")
+
+        assert GoalManager(session_id="source-goal").state.status == "active"
+        assert GoalManager(session_id="target-goal").state.goal == "target target"
+
+
 class TestJudgeGoalWithSubgoals:
     def test_judge_uses_subgoals_template_when_provided(self, hermes_home):
         """judge_goal switches templates when subgoals is non-empty.

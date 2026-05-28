@@ -279,6 +279,45 @@ def clear_goal(session_id: str) -> None:
     save_goal(session_id, state)
 
 
+def migrate_goal_session(source_session_id: str, target_session_id: str) -> bool:
+    """Move an active/paused goal when a conversation rotates session ids.
+
+    Context compression creates a fresh session id while preserving the visible
+    conversation.  /goal state is keyed by session id, so the continuation hook
+    must carry the goal state over before it binds GoalManager to the new id.
+
+    Returns True when a goal was copied to the target id and the source was
+    marked cleared.  Existing non-cleared target goals are left untouched.
+    """
+    source_session_id = (source_session_id or "").strip()
+    target_session_id = (target_session_id or "").strip()
+    if not source_session_id or not target_session_id:
+        return False
+    if source_session_id == target_session_id:
+        return False
+
+    source = load_goal(source_session_id)
+    if source is None or source.status not in {"active", "paused"}:
+        return False
+
+    existing = load_goal(target_session_id)
+    if existing is not None and existing.status != "cleared":
+        logger.info(
+            "GoalManager: refusing to migrate goal %s → %s; target already has %s goal",
+            source_session_id,
+            target_session_id,
+            existing.status,
+        )
+        return False
+
+    save_goal(target_session_id, source)
+    source.status = "cleared"
+    source.last_reason = f"migrated to {target_session_id}"
+    save_goal(source_session_id, source)
+    logger.info("GoalManager: migrated goal %s → %s", source_session_id, target_session_id)
+    return True
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Judge
 # ──────────────────────────────────────────────────────────────────────
@@ -758,5 +797,6 @@ __all__ = [
     "load_goal",
     "save_goal",
     "clear_goal",
+    "migrate_goal_session",
     "judge_goal",
 ]
