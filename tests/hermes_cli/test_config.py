@@ -478,6 +478,13 @@ class TestOptionalEnvVarsRegistry:
         from hermes_cli.config import OPTIONAL_ENV_VARS
         assert OPTIONAL_ENV_VARS["TAVILY_API_KEY"]["url"] == "https://app.tavily.com/home"
 
+    def test_tavily_api_keys_registered(self):
+        """TAVILY_API_KEYS is listed in OPTIONAL_ENV_VARS for multi-key pools."""
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        assert "TAVILY_API_KEYS" in OPTIONAL_ENV_VARS
+        assert OPTIONAL_ENV_VARS["TAVILY_API_KEYS"]["password"] is True
+        assert OPTIONAL_ENV_VARS["TAVILY_API_KEYS"]["category"] == "tool"
+
     def test_tavily_in_env_vars_by_version(self):
         """TAVILY_API_KEY is listed in ENV_VARS_BY_VERSION."""
         from hermes_cli.config import ENV_VARS_BY_VERSION

@@ -29,6 +29,41 @@ class TestTavilyRequest:
             with pytest.raises(ValueError, match="TAVILY_API_KEY"):
                 _tavily_request("search", {"query": "test"})
 
+    def test_parses_multi_key_pool(self):
+        """Tavily accepts comma/newline-separated multi-key env values."""
+        with patch.dict(
+            os.environ,
+            {
+                "TAVILY_API_KEY": "tvly-a, tvly-b\ntvly-c",
+                "TAVILY_API_KEYS": "tvly-c;tvly-d",
+                "TAVILY_API_KEY_2": "tvly-f",
+                "TAVILY_API_KEY_1": "tvly-e",
+            },
+        ):
+            from tools.web_tools import _get_tavily_api_keys
+
+            assert _get_tavily_api_keys() == [
+                "tvly-a",
+                "tvly-b",
+                "tvly-c",
+                "tvly-d",
+                "tvly-e",
+                "tvly-f",
+            ]
+
+    def test_parses_json_list_key_pool(self):
+        """TAVILY_API_KEYS can be written as a JSON-style .env list."""
+        with patch.dict(
+            os.environ,
+            {
+                "TAVILY_API_KEY": "",
+                "TAVILY_API_KEYS": '["tvly-a", "tvly-b"]',
+            },
+        ):
+            from tools.web_tools import _get_tavily_api_keys
+
+            assert _get_tavily_api_keys() == ["tvly-a", "tvly-b"]
+
     def test_posts_with_api_key_in_body(self):
         """api_key is injected into the JSON payload."""
         mock_response = MagicMock()
@@ -46,6 +81,120 @@ class TestTavilyRequest:
                 assert payload["api_key"] == "tvly-test-key"
                 assert payload["query"] == "hello"
                 assert "api.tavily.com/search" in call_kwargs.args[0]
+
+    def test_fill_first_uses_first_available_key(self, tmp_path):
+        """Fill-first policy keeps using the first configured key while it works."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"results": []}
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(tmp_path),
+                "TAVILY_API_KEY": "tvly-first,tvly-second",
+            },
+        ):
+            with patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post:
+                from tools.web_tools import _tavily_request
+
+                _tavily_request("search", {"query": "hello"})
+
+                payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
+                assert payload["api_key"] == "tvly-first"
+
+    def test_quota_failure_cools_key_and_tries_next(self, tmp_path):
+        """Quota/auth-style failures cool the key and fail over to the next one."""
+        import httpx as _httpx
+
+        failed_response = MagicMock()
+        failed_response.status_code = 429
+        failed_response.headers = {"retry-after": "120"}
+        failed_response.raise_for_status.side_effect = _httpx.HTTPStatusError(
+            "429 Too Many Requests", request=MagicMock(), response=failed_response
+        )
+        ok_response = MagicMock()
+        ok_response.raise_for_status = MagicMock()
+        ok_response.json.return_value = {"results": []}
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(tmp_path),
+                "TAVILY_API_KEY": "tvly-first,tvly-second",
+            },
+        ):
+            with patch("tools.web_tools.httpx.post", side_effect=[failed_response, ok_response]) as mock_post:
+                from tools.web_tools import _tavily_request
+
+                result = _tavily_request("search", {"query": "hello"})
+
+                assert result == {"results": []}
+                payloads = [call.kwargs.get("json") or call[1].get("json") for call in mock_post.call_args_list]
+                assert [payload["api_key"] for payload in payloads] == ["tvly-first", "tvly-second"]
+
+    def test_cooled_key_is_skipped_until_cooldown_expires(self, tmp_path):
+        """A cooled first key re-enters only after cooldown and a real request."""
+        import httpx as _httpx
+        from plugins.web.tavily import provider as tavily_provider
+
+        failed_response = MagicMock()
+        failed_response.status_code = 429
+        failed_response.headers = {"retry-after": "120"}
+        failed_response.raise_for_status.side_effect = _httpx.HTTPStatusError(
+            "429 Too Many Requests", request=MagicMock(), response=failed_response
+        )
+        ok_response = MagicMock()
+        ok_response.raise_for_status = MagicMock()
+        ok_response.json.return_value = {"results": []}
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(tmp_path),
+                "TAVILY_API_KEY": "tvly-first,tvly-second",
+            },
+        ), patch("plugins.web.tavily.provider.time.time", return_value=1000):
+            with patch("tools.web_tools.httpx.post", side_effect=[failed_response, ok_response]):
+                from tools.web_tools import _tavily_request
+
+                _tavily_request("search", {"query": "hello"})
+
+        # Before cooldown expiry, the first key is skipped.
+        ok_response_2 = MagicMock()
+        ok_response_2.raise_for_status = MagicMock()
+        ok_response_2.json.return_value = {"results": []}
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(tmp_path),
+                "TAVILY_API_KEY": "tvly-first,tvly-second",
+            },
+        ), patch("plugins.web.tavily.provider.time.time", return_value=1050):
+            with patch("tools.web_tools.httpx.post", return_value=ok_response_2) as mock_post:
+                from tools.web_tools import _tavily_request
+
+                _tavily_request("search", {"query": "hello"})
+                payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
+                assert payload["api_key"] == "tvly-second"
+
+        # After cooldown expiry, fill-first tries the first key again on real use.
+        ok_response_3 = MagicMock()
+        ok_response_3.raise_for_status = MagicMock()
+        ok_response_3.json.return_value = {"results": []}
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(tmp_path),
+                "TAVILY_API_KEY": "tvly-first,tvly-second",
+            },
+        ), patch.object(tavily_provider.time, "time", return_value=1121):
+            with patch("tools.web_tools.httpx.post", return_value=ok_response_3) as mock_post:
+                from tools.web_tools import _tavily_request
+
+                _tavily_request("search", {"query": "hello"})
+                payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
+                assert payload["api_key"] == "tvly-first"
 
     def test_raises_on_http_error(self):
         """Non-2xx responses propagate as httpx.HTTPStatusError."""

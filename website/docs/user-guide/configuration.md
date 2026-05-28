@@ -1440,15 +1440,15 @@ web:
   extract_backend: "firecrawl"
 ```
 
-| Backend | Env Var | Search | Extract |
-|---------|---------|--------|---------|
-| **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ |
-| **SearXNG** | `SEARXNG_URL` | ✔ | — |
-| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ |
-| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ |
-| **Exa** | `EXA_API_KEY` | ✔ | ✔ |
+| Backend | Env Var | Search | Extract | Crawl |
+|---------|---------|--------|---------|-------|
+| **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ | ✔ |
+| **SearXNG** | `SEARXNG_URL` | ✔ | — | — |
+| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | — |
+| **Tavily** | `TAVILY_API_KEY` / `TAVILY_API_KEYS` | ✔ | ✔ | ✔ |
+| **Exa** | `EXA_API_KEY` | ✔ | ✔ | — |
 
-**Backend selection:** If `web.backend` is not set, the backend is auto-detected from available API keys. If only `SEARXNG_URL` is set, SearXNG is used. If only `EXA_API_KEY` is set, Exa is used. If only `TAVILY_API_KEY` is set, Tavily is used. If only `PARALLEL_API_KEY` is set, Parallel is used. Otherwise Firecrawl is the default.
+**Backend selection:** If `web.backend` is not set, the backend is auto-detected from available API keys. If only `SEARXNG_URL` is set, SearXNG is used. If only `EXA_API_KEY` is set, Exa is used. If only `TAVILY_API_KEY` or `TAVILY_API_KEYS` is set, Tavily is used. If only `PARALLEL_API_KEY` is set, Parallel is used. Otherwise Firecrawl is the default.
 
 **SearXNG** is a free, self-hosted, privacy-respecting metasearch engine that queries 70+ search engines. No API key needed — just set `SEARXNG_URL` to your instance (e.g., `http://localhost:8080`). SearXNG is search-only; `web_extract` requires a separate extract provider (set `web.extract_backend`). See the [Web Search setup guide](/user-guide/features/web-search) for Docker setup instructions.
 

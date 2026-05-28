@@ -2523,12 +2523,21 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "TAVILY_API_KEY": {
-        "description": "Tavily API key for AI-native web search and extract",
-        "prompt": "Tavily API key",
+        "description": "Tavily API key(s) for AI-native web search, extract, and crawl; accepts comma/newline-separated keys",
+        "prompt": "Tavily API key(s)",
         "url": "https://app.tavily.com/home",
         "tools": ["web_search", "web_extract"],
         "password": True,
         "category": "tool",
+    },
+    "TAVILY_API_KEYS": {
+        "description": "Optional explicit Tavily multi-key pool; comma/newline-separated keys are tried fill-first with cooldown failover",
+        "prompt": "Tavily API keys",
+        "url": "https://app.tavily.com/home",
+        "tools": ["web_search", "web_extract", "web_crawl"],
+        "password": True,
+        "category": "tool",
+        "advanced": True,
     },
     "SEARXNG_URL": {
         "description": "URL of your SearXNG instance for free self-hosted web search",

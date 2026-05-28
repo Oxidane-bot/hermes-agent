@@ -16,16 +16,16 @@ Both are configured through a single backend selection. Providers are chosen via
 
 ## Backends
 
-| Provider | Env Var | Search | Extract | Free tier |
-|----------|---------|--------|---------|-----------|
-| **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ | 500 credits/mo |
-| **SearXNG** | `SEARXNG_URL` | ✔ | — | ✔ Free (self-hosted) |
-| **Brave Search (free tier)** | `BRAVE_SEARCH_API_KEY` | ✔ | — | 2 000 queries/mo |
-| **DDGS (DuckDuckGo)** | — (no key) | ✔ | — | ✔ Free |
-| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
-| **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
-| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | Paid |
-| **xAI (Grok)** | `XAI_API_KEY` or `hermes auth login xai-oauth` | ✔ | — | Paid (SuperGrok or per-token) |
+| Provider | Env Var | Search | Extract | Crawl | Free tier |
+|----------|---------|--------|---------|-------|-----------|
+| **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ | ✔ | 500 credits/mo |
+| **SearXNG** | `SEARXNG_URL` | ✔ | — | — | ✔ Free (self-hosted) |
+| **Brave Search (free tier)** | `BRAVE_SEARCH_API_KEY` | ✔ | — | — | 2 000 queries/mo |
+| **DDGS (DuckDuckGo)** | — (no key) | ✔ | — | — | ✔ Free |
+| **Tavily** | `TAVILY_API_KEY` / `TAVILY_API_KEYS` | ✔ | ✔ | ✔ | 1 000 searches/mo |
+| **Exa** | `EXA_API_KEY` | ✔ | ✔ | — | 1 000 searches/mo |
+| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | — | Paid |
+| **xAI (Grok)** | `XAI_API_KEY` or `hermes auth login xai-oauth` | ✔ | — | — | Paid (SuperGrok or per-token) |
 
 Brave Search, DDGS, and xAI are **search-only** — pair any of them with Firecrawl/Tavily/Exa/Parallel when you also need `web_extract`. DDGS uses the [`ddgs` Python package](https://pypi.org/project/ddgs/) under the hood; if it isn't already installed, run `pip install ddgs` (or let Hermes lazy-install it on first use). xAI runs Grok's server-side `web_search` tool on the Responses API — results are LLM-generated rather than index-backed, so titles, descriptions, and URL choice are all model output (see the [trust-model caveat](#xai-grok) below).
 
@@ -242,6 +242,14 @@ AI-optimised search and extract with a generous free tier.
 ```bash
 # ~/.hermes/.env
 TAVILY_API_KEY=tvly-your-key-here
+
+# Optional: fill-first multi-key pool. Hermes uses the first available key
+# until Tavily returns a quota/auth failure, then cools it down and tries the
+# next key. Cooled keys are retried only on future real web requests.
+TAVILY_API_KEYS=tvly-key-1,tvly-key-2,tvly-key-3
+
+# JSON-style lists are also accepted by the plugin if you prefer that shape:
+TAVILY_API_KEYS=["tvly-key-1","tvly-key-2","tvly-key-3"]
 ```
 
 Get a key at [app.tavily.com](https://app.tavily.com/home). The free tier includes 1 000 searches/month.
@@ -359,7 +367,7 @@ If no backend is explicitly configured, Hermes picks the first available one bas
 |--------------------|-----------------------|
 | `FIRECRAWL_API_KEY` or `FIRECRAWL_API_URL` | firecrawl |
 | `PARALLEL_API_KEY` | parallel |
-| `TAVILY_API_KEY` | tavily |
+| `TAVILY_API_KEY` or `TAVILY_API_KEYS` | tavily |
 | `EXA_API_KEY` | exa |
 | `SEARXNG_URL` | searxng |
 

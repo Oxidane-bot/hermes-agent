@@ -259,6 +259,7 @@ class TestBackendSelection:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "TAVILY_API_KEYS",
     )
 
     def setup_method(self):
@@ -352,6 +353,13 @@ class TestBackendSelection:
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
+            assert _get_backend() == "tavily"
+
+    def test_fallback_tavily_plural_keys_only(self):
+        """Only TAVILY_API_KEYS set → 'tavily'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"TAVILY_API_KEYS": "tvly-a,tvly-b"}):
             assert _get_backend() == "tavily"
 
     def test_fallback_tavily_with_firecrawl_prefers_firecrawl(self):
@@ -558,6 +566,7 @@ class TestCheckWebApiKey:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "TAVILY_API_KEYS",
     )
 
     def setup_method(self):
@@ -598,6 +607,11 @@ class TestCheckWebApiKey:
 
     def test_tavily_key_only(self):
         with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is True
+
+    def test_tavily_plural_keys_only(self):
+        with patch.dict(os.environ, {"TAVILY_API_KEYS": "tvly-a,tvly-b"}):
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
