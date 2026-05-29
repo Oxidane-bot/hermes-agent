@@ -2534,7 +2534,7 @@ class TestCodexAdapterReasoningTranslation:
             }
         ]
 
-    def test_xai_responses_adapter_strips_replayed_encrypted_reasoning(self):
+    def test_xai_responses_adapter_preserves_replayed_encrypted_reasoning(self):
         from agent.auxiliary_client import _CodexCompletionsAdapter
 
         adapter, captured = self._build_adapter()
@@ -2552,8 +2552,8 @@ class TestCodexAdapterReasoningTranslation:
                     "codex_reasoning_items": [
                         {
                             "type": "reasoning",
-                            "id": "rs_xai_rejects_this",
-                            "encrypted_content": "xai-should-not-see-this",
+                            "id": "rs_xai_keeps_this",
+                            "encrypted_content": "xai-should-see-this",
                         }
                     ],
                 },
@@ -2561,8 +2561,8 @@ class TestCodexAdapterReasoningTranslation:
             ]
         )
 
-        assert not any(
-            item.get("encrypted_content") == "xai-should-not-see-this"
+        assert any(
+            item.get("encrypted_content") == "xai-should-see-this"
             for item in captured["input"]
         )
 

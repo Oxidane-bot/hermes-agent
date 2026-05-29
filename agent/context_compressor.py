@@ -1165,7 +1165,7 @@ Write only the summary body. Start at "## Active Task"; do not include any pream
                 # compression model (e.g. gpt-5.5) while still allowing a
                 # model override for fallback attempts below.
                 _model_candidates.append(None)
-            for _fallback_model in self.summary_fallback_models:
+            for _fallback_model in getattr(self, "summary_fallback_models", []):
                 if _fallback_model not in _model_candidates:
                     _model_candidates.append(_fallback_model)
 
