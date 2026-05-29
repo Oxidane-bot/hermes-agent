@@ -37,6 +37,14 @@ def _patch_agent_bootstrap(monkeypatch):
         ],
     )
     monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(
+        "agent.model_metadata._fetch_codex_oauth_context_lengths",
+        lambda access_token: {},
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_usage_cost",
+        lambda *a, **k: SimpleNamespace(amount_usd=None, status="unknown", source="test"),
+    )
 
 
 def _build_agent(monkeypatch):
