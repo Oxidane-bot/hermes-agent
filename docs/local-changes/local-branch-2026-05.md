@@ -1,9 +1,59 @@
 # May 2026 Local Branch Changes
 
-Baseline: `fork/local` at `eb76cdd740dc4dcf07542eb7c217b642d03b763b`.
+Original baseline: `fork/local` at `eb76cdd740dc4dcf07542eb7c217b642d03b763b`.
 Current local head when this document was created: `27815ffb8`.
 
+Forward-port check baseline: upstream release `v2026.5.29.2` (`77a1650c7`),
+checked on branch `upgrade/v2026.5.29.2-check`.
+
 This file documents the local-only commits above the fork baseline so future maintenance can tell which behavior is intentional and which can be dropped when upstream catches up.
+
+## Forward-port status against `v2026.5.29.2`
+
+When updating from the old local branch to upstream `v2026.5.29.2`, do **not**
+replay `ee12c69f7 chore: sync local fork to May 2026 snapshot`. That commit was
+a historical upstream snapshot sync, not a local customization. Replaying it on
+top of the latest release would drag many files back toward an older upstream
+state.
+
+Instead, use the latest release as the base and forward-port only the local
+behavioral deltas below.
+
+| Original commit | Forward-port status on `upgrade/v2026.5.29.2-check` | Notes |
+|---|---|---|
+| `eb76cdd74` | Ported | Checkpoint-framed v2 compaction retained. One upstream test expectation was merged with the local checkpoint prompt shape. |
+| `b8825c787` | Ported with refactor adaptation | `run_agent.py` init changes moved to upstream's `agent/agent_init.py`; auxiliary Responses replay retained. |
+| `54cd78206` | Ported | Voice replies can satisfy pending clarify prompts while preserving upstream's audio-file attachment handling. |
+| `f1431f9db` | Not replayed | Superseded by upstream/new local `agent.codex_runtime` event-stream handling; old `responses.stream().get_final_response()` assertions are obsolete. |
+| `9b6f33272` | Not replayed | Superseded by upstream `codex_runtime` raw event consumption and null-output regression coverage. |
+| `c8f0de31b` | Not replayed | Same stream-recovery cluster as above; replaying would reintroduce old stream helper paths. |
+| `eb9c7e9cc` | Ported | Anthropic fast mode remains separate from service-tier priority. |
+| `6351d442a` | Ported | `/goal` migration across compression session splits retained and combined with upstream Telegram topic rebinding/session-store save behavior. |
+| `27815ffb8` | Ported with docs merge | Tavily multi-key/cooldown/crawl auth retained; web-search docs merged with upstream's newer Brave/DDGS/xAI provider rows. |
+| `20df23368` | Ported | This documentation directory retained. |
+
+Additional branch-only compatibility commits:
+
+- `9bb825941` updates tests and minor compatibility around upstream's current
+  runtime semantics: `ContextCompressor._generate_summary()` now receives
+  `protected_head`, and xAI Responses replay keeps encrypted reasoning per
+  upstream `agent.codex_responses_adapter` behavior.
+- `74a0085ab` keeps Codex response tests hermetic by mocking live metadata and
+  pricing lookups that the latest release may otherwise perform during unit
+  tests.
+
+Verification for the forward-port branch:
+
+- `scripts/run_tests.sh tests/agent/test_context_compressor.py tests/agent/test_compress_focus.py tests/agent/test_context_compressor_summary_continuity.py tests/agent/test_auxiliary_client.py tests/run_agent/test_run_agent_codex_responses.py tests/cli/test_fast_command.py tests/gateway/test_fast_command.py tests/hermes_cli/test_goals.py tests/tools/test_web_tools_tavily.py tests/tools/test_web_tools_config.py tests/hermes_cli/test_config.py`
+  — 606 tests passed.
+- `scripts/run_tests.sh tests/gateway/test_compression_session_id_persistence.py tests/gateway/test_goal_status_notice.py tests/gateway/test_session_hygiene.py tests/gateway/test_voice_command.py tests/test_cli_manual_compress.py tests/cli/test_cli_skin_integration.py tests/providers/test_e2e_wiring.py`
+  — 226 tests passed.
+- `git diff --check` and `python3 -m py_compile` on modified Python surfaces
+  passed. `cli.py` still emits an existing `return in finally` SyntaxWarning.
+
+Operational caveat: no live gateway smoke was run because using the real
+`~/.hermes` gateway config can interfere with currently running production
+adapters, tokens, webhooks, sessions, and outbound message delivery.
 
 ## Summary table
 
