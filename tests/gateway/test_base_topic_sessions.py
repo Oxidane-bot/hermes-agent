@@ -175,6 +175,75 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_process_message_background_sends_tar_xz_media_attachment(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+        archive = tmp_path / "public bundle.tar.xz"
+        archive.write_bytes(b"archive")
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return f"done\nMEDIA:\"{archive}\""
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        adapter.send_document = AsyncMock(
+            return_value=SendResult(success=True, message_id="doc-1")
+        )
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        adapter.send_document.assert_awaited_once()
+        assert adapter.send_document.await_args.kwargs["file_path"] == str(archive)
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "done",
+                "reply_to": None,
+                "metadata": {"thread_id": "17585", "notify": True},
+            }
+        ]
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_warns_when_media_attachment_fails(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+        archive = tmp_path / "public.tar.xz"
+        archive.write_bytes(b"archive")
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return f"done\nMEDIA:{archive}"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        adapter.send_document = AsyncMock(
+            return_value=SendResult(success=False, error="Timed out")
+        )
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert len(adapter.sent) == 2
+        assert adapter.sent[0]["content"] == "done"
+        assert "File delivery failed" in adapter.sent[1]["content"]
+        assert str(archive) in adapter.sent[1]["content"]
+        assert "Timed out" in adapter.sent[1]["content"]
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_exception_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 

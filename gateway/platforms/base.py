@@ -2458,7 +2458,7 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|tar|gz|tgz|bz2|xz|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -3539,14 +3539,59 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        media_delivery_errors: List[str] = []
 
-        def _record_delivery(result):
+        def _record_delivery(result, *, media_label: Optional[str] = None):
             nonlocal delivery_attempted, delivery_succeeded
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+            elif media_label:
+                error = getattr(result, "error", None) or "unknown error"
+                media_delivery_errors.append(f"{media_label}: {error}")
+
+        def _record_media_exception(media_label: str, exc: BaseException) -> None:
+            nonlocal delivery_attempted
+            delivery_attempted = True
+            media_delivery_errors.append(f"{media_label}: {exc}")
+
+        def _record_unparsed_media_directives(text: str) -> None:
+            """Surface MEDIA directives that could not be parsed into uploads."""
+            nonlocal delivery_attempted
+            leftovers = re.findall(r"MEDIA:\s*[^\n\r]+", text or "")
+            for directive in leftovers:
+                delivery_attempted = True
+                media_delivery_errors.append(
+                    f"{directive.strip()}: unsupported MEDIA path or extension"
+                )
+
+        async def _notify_media_delivery_errors() -> None:
+            if not media_delivery_errors:
+                return
+            shown = media_delivery_errors[:3]
+            remaining = len(media_delivery_errors) - len(shown)
+            lines = "\n".join(f"- {item}" for item in shown)
+            if remaining > 0:
+                lines += f"\n- ... and {remaining} more"
+            try:
+                await self._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=(
+                        "⚠️ File delivery failed or is incomplete.\n"
+                        "My text reply may have been sent, but these attachments were not confirmed delivered:\n"
+                        f"{lines}"
+                    ),
+                    reply_to=_reply_anchor_for_event(event),
+                    metadata={"notify": True, **(_thread_metadata or {})},
+                )
+            except Exception as notify_err:
+                logger.warning(
+                    "[%s] Failed to send media-delivery failure notice: %s",
+                    self.name,
+                    notify_err,
+                )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -3633,6 +3678,7 @@ class BasePlatformAdapter(ABC):
                 # Strip any remaining internal directives from message body (fixes #1561)
                 text_content = text_content.replace("[[audio_as_voice]]", "").strip()
                 text_content = text_content.replace("[[as_document]]", "").strip()
+                _record_unparsed_media_directives(text_content)
                 text_content = re.sub(r"MEDIA:\s*\S+", "", text_content).strip()
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
@@ -3817,8 +3863,10 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                        _record_delivery(media_result, media_label=media_path)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        _record_media_exception(media_path, media_err)
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -3827,22 +3875,27 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        _record_delivery(file_result, media_label=file_path)
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        _record_media_exception(file_path, file_err)
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            await _notify_media_delivery_errors()
+            processing_ok = (
+                delivery_succeeded if delivery_attempted else not bool(response)
+            ) and not media_delivery_errors
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,

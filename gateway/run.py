@@ -11644,9 +11644,50 @@ class GatewayRunner:
 
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
+            media_delivery_errors: list[str] = []
+
+            def _record_media_result(label: str, result) -> None:
+                if result is None or getattr(result, "success", False):
+                    return
+                media_delivery_errors.append(
+                    f"{label}: {getattr(result, 'error', None) or 'unknown error'}"
+                )
+
+            def _record_media_exception(label: str, exc: BaseException) -> None:
+                media_delivery_errors.append(f"{label}: {exc}")
+
+            async def _notify_media_delivery_errors() -> None:
+                if not media_delivery_errors or not hasattr(adapter, "send"):
+                    return
+                shown = media_delivery_errors[:3]
+                remaining = len(media_delivery_errors) - len(shown)
+                lines = "\n".join(f"- {item}" for item in shown)
+                if remaining > 0:
+                    lines += f"\n- ... and {remaining} more"
+                try:
+                    await adapter.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            "⚠️ File delivery failed or is incomplete.\n"
+                            "My text reply may have been sent, but these attachments were not confirmed delivered:\n"
+                            f"{lines}"
+                        ),
+                        metadata={"notify": True, **(_thread_meta or {})},
+                    )
+                except Exception as notify_err:
+                    logger.warning(
+                        "[%s] Post-stream media failure notice failed: %s",
+                        adapter.name,
+                        notify_err,
+                    )
+
             media_files, _ = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             _, cleaned = adapter.extract_images(response)
+            for directive in re.findall(r"MEDIA:\s*[^\n\r]+", cleaned or ""):
+                media_delivery_errors.append(
+                    f"{directive.strip()}: unsupported MEDIA path or extension"
+                )
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
 
@@ -11688,48 +11729,55 @@ class GatewayRunner:
                     )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    _record_media_exception("image batch", e)
 
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    _record_media_result(media_path, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    _record_media_exception(media_path, e)
 
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=file_path,
                             metadata=_thread_meta,
                         )
+                    _record_media_result(file_path, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    _record_media_exception(file_path, e)
+
+            await _notify_media_delivery_errors()
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)

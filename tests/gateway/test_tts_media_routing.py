@@ -192,6 +192,39 @@ async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_doc
 
 
 @pytest.mark.asyncio
+async def test_streaming_delivery_warns_when_document_send_fails(tmp_path, monkeypatch):
+    event = _event(thread_id="topic-1")
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "release.tar.xz")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=False, error="Timed out")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"MEDIA:{media_file}",
+        event,
+        adapter,
+    )
+
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="chat-1",
+        file_path=str(media_file),
+        metadata={"thread_id": "topic-1"},
+    )
+    adapter.send.assert_awaited_once()
+    assert "File delivery failed" in adapter.send.await_args.kwargs["content"]
+    assert str(media_file) in adapter.send.await_args.kwargs["content"]
+
+
+@pytest.mark.asyncio
 async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(tmp_path, monkeypatch):
     """MP3 audio on Telegram must go through send_voice (which routes to
     sendAudio internally); Telegram accepts MP3 for the audio player."""

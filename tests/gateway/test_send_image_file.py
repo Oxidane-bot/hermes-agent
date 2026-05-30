@@ -57,6 +57,18 @@ class TestExtractMediaImages:
         assert "/audio.ogg" in paths
         assert "/screenshot.png" in paths
 
+    def test_tar_xz_archive_extracted(self):
+        content = "Package:\nMEDIA:/tmp/O-Level_English_7PDF_Public_20260530.tar.xz"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/tmp/O-Level_English_7PDF_Public_20260530.tar.xz", False)]
+        assert "MEDIA:" not in cleaned
+
+    def test_quoted_archive_path_with_spaces_extracted(self):
+        content = 'Package:\nMEDIA:"/home/user/lesson plan/release/public bundle.tar.xz"'
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/home/user/lesson plan/release/public bundle.tar.xz", False)]
+        assert "MEDIA:" not in cleaned
+
 
 # ---------------------------------------------------------------------------
 # Telegram send_image_file tests
