@@ -4,6 +4,9 @@
 
 # Hermes Agent ☤
 
+> **Fork status:** This checkout is maintained as a personal, needs-driven fork of upstream [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent). The fork keeps its own operational changes on a local primary line and follows official upstream releases when they are useful or required. It is not intended to present the branch list as a PR staging queue for upstream.
+
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
   <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
