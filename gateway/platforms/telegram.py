@@ -2698,6 +2698,62 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_skill_proposal(
+        self,
+        chat_id: str,
+        proposal: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render approve/reject buttons for a background-review skill proposal."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        proposal_id = str(proposal.get("proposal_id") or "").strip()
+        name = str(proposal.get("name") or "").strip()
+        if not proposal_id:
+            return SendResult(success=False, error="proposal_id is required")
+
+        try:
+            text = (
+                "📝 **Skill proposal**\n\n"
+                f"Background review drafted `{name or proposal_id}`.\n"
+                f"Proposal ID: `{proposal_id}`\n\n"
+                "Approve to install it as a live skill, or reject to archive the draft.\n"
+                f"Text fallback: `/skill-proposal show {proposal_id}`, "
+                f"`/skill-proposal approve {proposal_id}`, "
+                f"`/skill-proposal reject {proposal_id}`."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"sp:a:{proposal_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"sp:r:{proposal_id}"),
+                ],
+            ])
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": self.format_message(text),
+                "parse_mode": ParseMode.MARKDOWN_V2,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_skill_proposal failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -3195,6 +3251,61 @@ class TelegramAdapter(BasePlatformAdapter):
                 # button click.
                 if count and query_chat_id is not None:
                     self.resume_typing_for_chat(str(query_chat_id))
+            return
+
+        # --- Skill proposal callbacks (sp:a:<id> | sp:r:<id>) ---
+        if data.startswith("sp:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                verb = parts[1]
+                proposal_id = parts[2]
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to approve skill proposals.")
+                    return
+
+                try:
+                    from tools.skill_manager_tool import (
+                        _approve_skill_proposal,
+                        _reject_skill_proposal,
+                    )
+                    if verb == "a":
+                        result = _approve_skill_proposal(proposal_id)
+                        action_label = "approved"
+                    elif verb == "r":
+                        result = _reject_skill_proposal(proposal_id)
+                        action_label = "rejected"
+                    else:
+                        await query.answer(text="Invalid proposal action.")
+                        return
+                except Exception as exc:
+                    logger.error("[%s] skill proposal callback failed: %s", self.name, exc, exc_info=True)
+                    await query.answer(text="Skill proposal action failed.")
+                    return
+
+                if result.get("success"):
+                    label = "✅ Skill proposal approved" if action_label == "approved" else "❌ Skill proposal rejected"
+                    await query.answer(text=label)
+                else:
+                    label = "⚠️ Skill proposal not resolved"
+                    await query.answer(text=str(result.get("error") or label)[:200])
+
+                user_display = getattr(query.from_user, "first_name", "User")
+                message_text = result.get("message") if result.get("success") else result.get("error", "Skill proposal action failed.")
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(f"{label} by {user_display}\n\n{message_text}"),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
             return
 
         # --- Slash-confirm callbacks (sc:choice:confirm_id) ---

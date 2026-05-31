@@ -14,6 +14,7 @@ that caused the prefix-cache miss.
 """
 
 import threading
+import json
 from unittest.mock import patch
 
 
@@ -134,6 +135,7 @@ def test_background_review_installs_thread_local_whitelist():
     assert "delegate_task" not in whitelist
     assert "web_search" not in whitelist
     assert "execute_code" not in whitelist
+    assert "clarify" not in whitelist
 
 
 def test_background_review_agent_tools_are_limited():
@@ -157,3 +159,30 @@ def test_background_review_agent_tools_are_limited():
     assert "delegate_task" not in expected_tools
     assert "web_search" not in expected_tools
     assert "execute_code" not in expected_tools
+    assert "clarify" not in expected_tools
+
+
+def test_background_review_summary_distinguishes_skill_proposal():
+    from agent.background_review import (
+        summarize_background_review_action_details,
+        summarize_background_review_actions,
+    )
+    tool_msg = {
+        "role": "tool",
+        "tool_call_id": "tc1",
+        "content": json.dumps({
+            "success": True,
+            "action": "skill_proposal",
+            "proposal_id": "abc123",
+            "name": "safe-skill",
+            "message": "Skill proposal 'safe-skill' created for user approval (proposal_id=abc123).",
+        }),
+    }
+
+    details = summarize_background_review_action_details([tool_msg], [])
+    strings = summarize_background_review_actions([tool_msg], [])
+
+    assert details[0]["kind"] == "skill_proposal"
+    assert details[0]["proposal_id"] == "abc123"
+    assert strings == ["Skill proposal 'safe-skill' created for user approval (proposal_id=abc123)."]
+    assert "Skill 'safe-skill' created." not in strings[0]

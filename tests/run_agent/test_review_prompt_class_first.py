@@ -1,17 +1,8 @@
-"""Behavior tests for the skill review / combined review prompts.
+"""Behavior tests for the conservative background review prompts.
 
-The review prompts steer the background review agent toward actively updating
-the skill library after most sessions, with a strong bias toward:
-  1. Patching currently-loaded skills first,
-  2. Patching existing umbrellas next,
-  3. Adding references/ files under an existing umbrella,
-  4. Creating a new class-level umbrella only when nothing else fits.
-
-User-preference corrections (style, format, verbosity, legibility) are
-first-class skill signals, not just memory signals.
-
-These tests assert behavioral *instructions* are present — they do NOT
-snapshot the full prompt text (change-detector).
+The review prompts must be persistence-hygienic: read before write, treat
+``Nothing to save.`` as normal, keep memory/profile narrow, and propose new
+skills instead of creating them directly.
 """
 
 from run_agent import AIAgent
@@ -21,16 +12,16 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_is_conservative_and_proposal_only():
+    """Prompt must not frame background review as active-by-default."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
-    )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
-    )
+    lower = prompt.lower()
+    assert "nothing to save." in lower
+    assert "valid successful result" in lower
+    assert "propose_create" in prompt
+    assert "not directly created" in lower
+    assert "be active" not in lower
+    assert "missed learning opportunity" not in lower
 
 
 def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
@@ -68,7 +59,7 @@ def test_skill_review_prompt_has_four_step_preference_order():
     prompt = AIAgent._SKILL_REVIEW_PROMPT
     assert "PATCH" in prompt
     assert "references/" in prompt or "REFERENCE" in prompt
-    assert "CREATE" in prompt
+    assert "PROPOSE" in prompt
     assert "UMBRELLA" in prompt or "umbrella" in prompt
 
 
@@ -90,8 +81,8 @@ def test_skill_review_prompt_names_three_support_file_kinds():
     )
 
 
-def test_skill_review_prompt_has_name_veto_for_create():
-    """Creating a new skill must be gated behind class-level naming."""
+def test_skill_review_prompt_has_name_veto_for_propose_create():
+    """Proposing a new skill must be gated behind class-level naming."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
     assert "class level" in prompt.lower() or "CLASS-LEVEL" in prompt
     assert "MUST NOT" in prompt or "must not" in prompt, (
@@ -117,7 +108,7 @@ def test_skill_review_prompt_flags_overlap_and_defers_to_curator():
 
 
 def test_skill_review_prompt_still_has_opt_out_clause():
-    """'Nothing to save.' must remain as a real-but-not-default option."""
+    """'Nothing to save.' must remain a valid normal option."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
     assert "Nothing to save." in prompt
 
@@ -133,12 +124,17 @@ def test_combined_review_prompt_has_memory_section():
     assert "memory tool" in prompt
 
 
-def test_combined_review_prompt_skills_biased_toward_active_updates():
-    """Skills half must carry the active-update bias."""
+def test_combined_review_prompt_is_conservative_and_proposal_only():
+    """Combined prompt must carry the conservative skill-proposal gate."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
+    lower = prompt.lower()
     assert "**Skills**" in prompt
-    assert "ACTIVE" in prompt or "active" in prompt.lower()
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower()
+    assert "nothing to save." in lower
+    assert "valid successful result" in lower
+    assert "propose_create" in prompt
+    assert "not directly created" in lower
+    assert "be active" not in lower
+    assert "missed learning opportunity" not in lower
 
 
 def test_combined_review_prompt_treats_user_corrections_as_skill_signal():
@@ -161,7 +157,7 @@ def test_combined_review_prompt_has_four_step_skill_ladder():
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
     assert "PATCH" in prompt
     assert "references/" in prompt or "REFERENCE" in prompt
-    assert "CREATE" in prompt
+    assert "PROPOSE" in prompt
     assert "CLASS-LEVEL" in prompt or "class-level" in prompt or "class level" in prompt.lower()
 
 
@@ -226,10 +222,14 @@ def test_combined_review_prompt_has_anti_pattern_guidance():
 # _MEMORY_REVIEW_PROMPT — unchanged, still memory-focused
 # ---------------------------------------------------------------------------
 
-def test_memory_review_prompt_still_focused_on_user_facts():
-    """Memory-only review prompt stays focused on user facts — not touched by this change."""
+def test_memory_review_prompt_has_durability_gates():
+    """Memory-only review prompt keeps global memory/profile narrow."""
     prompt = AIAgent._MEMORY_REVIEW_PROMPT
-    # The memory-only prompt should NOT drift into skill territory
+    lower = prompt.lower()
+    assert "memory(action='read'" in prompt
+    assert "USER profile is only for stable user identity" in prompt
+    assert "MEMORY is only for durable environment/runtime facts" in prompt
+    assert "skill-specific operational facts" in lower
+    assert "Nothing to save." in prompt
     assert "skills_list" not in prompt
     assert "SURVEY" not in prompt
-    assert "memory tool" in prompt

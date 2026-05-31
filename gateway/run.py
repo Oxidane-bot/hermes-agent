@@ -7658,6 +7658,9 @@ class GatewayRunner:
         if canonical == "reload-skills":
             return await self._handle_reload_skills_command(event)
 
+        if canonical == "skill-proposal":
+            return await self._handle_skill_proposal_command(event)
+
         if canonical == "bundles":
             return await self._handle_bundles_command(event)
 
@@ -13748,6 +13751,51 @@ class GatewayRunner:
             logger.warning("Skills reload failed: %s", e)
             return t("gateway.reload_skills.failed", error=e)
 
+    async def _handle_skill_proposal_command(self, event: MessageEvent) -> str:
+        """Handle /skill-proposal show|approve|reject <proposal_id>."""
+        args = (event.get_command_args() or "").strip().split()
+        if len(args) < 2 or args[0].lower() not in {"show", "approve", "reject"}:
+            return (
+                "Usage: /skill-proposal <show|approve|reject> <proposal_id>\n"
+                "Approve installs a drafted skill; reject archives it without touching live skills."
+            )
+
+        action = args[0].lower()
+        proposal_id = args[1].strip()
+        try:
+            from tools.skill_manager_tool import (
+                _approve_skill_proposal,
+                _load_skill_proposal,
+                _reject_skill_proposal,
+            )
+            if action == "show":
+                result = _load_skill_proposal(proposal_id)
+                if not result.get("success"):
+                    return f"⚠️ {result.get('error', 'Skill proposal not found.')}"
+                content = str(result.get("content") or "")
+                preview = content if len(content) <= 2600 else content[:2600] + "\n…"
+                name = result.get("name") or proposal_id
+                category = result.get("category") or "(none)"
+                return (
+                    f"📝 Skill proposal `{proposal_id}`\n"
+                    f"Name: `{name}`\n"
+                    f"Category: `{category}`\n\n"
+                    f"```markdown\n{preview}\n```\n\n"
+                    f"Approve: `/skill-proposal approve {proposal_id}`\n"
+                    f"Reject: `/skill-proposal reject {proposal_id}`"
+                )
+            if action == "approve":
+                result = _approve_skill_proposal(proposal_id)
+            else:
+                result = _reject_skill_proposal(proposal_id)
+        except Exception as exc:
+            logger.error("Skill proposal command failed: %s", exc, exc_info=True)
+            return f"⚠️ Skill proposal command failed: {exc}"
+
+        if result.get("success"):
+            return str(result.get("message") or "Skill proposal resolved.")
+        return f"⚠️ {result.get('error', 'Skill proposal not resolved.')}"
+
     async def _handle_bundles_command(self, event: MessageEvent) -> str:
         """Handle /bundles — list installed skill bundles.
 
@@ -16986,6 +17034,7 @@ class GatewayRunner:
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
+            _bg_review_pending_proposals: list[dict] = []
             _bg_review_pending_lock = threading.Lock()
 
             def _deliver_bg_review_message(message: str) -> None:
@@ -17002,13 +17051,58 @@ class GatewayRunner:
                     log_message="background_review_callback scheduling error",
                 )
 
+            def _deliver_bg_review_proposal(proposal: dict) -> None:
+                if not _status_adapter or not _run_still_current():
+                    return
+
+                async def _send_proposal():
+                    proposal_id = str(proposal.get("proposal_id") or "")
+                    name = str(proposal.get("name") or proposal_id)
+                    result = None
+                    send_skill_proposal = getattr(_status_adapter, "send_skill_proposal", None)
+                    if callable(send_skill_proposal):
+                        try:
+                            result = await send_skill_proposal(
+                                chat_id=_status_chat_id,
+                                proposal=proposal,
+                                metadata=_status_thread_metadata,
+                            )
+                        except Exception as exc:
+                            logger.debug("send_skill_proposal failed: %s", exc)
+                            result = None
+                    if not (result and getattr(result, "success", False)):
+                        text = (
+                            "📝 Skill proposal pending approval\n\n"
+                            f"Name: `{name}`\n"
+                            f"Proposal ID: `{proposal_id}`\n\n"
+                            f"Show: `/skill-proposal show {proposal_id}`\n"
+                            f"Approve: `/skill-proposal approve {proposal_id}`\n"
+                            f"Reject: `/skill-proposal reject {proposal_id}`"
+                        )
+                        await _status_adapter.send(
+                            _status_chat_id,
+                            text,
+                            metadata=_status_thread_metadata,
+                        )
+
+                safe_schedule_threadsafe(
+                    _send_proposal(),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="background_review_proposal_callback scheduling error",
+                )
+
             def _release_bg_review_messages() -> None:
                 _bg_review_release.set()
                 with _bg_review_pending_lock:
                     pending = list(_bg_review_pending)
                     _bg_review_pending.clear()
+                    pending_proposals = list(_bg_review_pending_proposals)
+                    _bg_review_pending_proposals.clear()
                 for queued in pending:
                     _deliver_bg_review_message(queued)
+                for proposal in pending_proposals:
+                    _deliver_bg_review_proposal(proposal)
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
@@ -17022,6 +17116,18 @@ class GatewayRunner:
                 _deliver_bg_review_message(message)
 
             agent.background_review_callback = _bg_review_send
+
+            def _bg_review_skill_proposal_send(proposal: dict) -> None:
+                if not _status_adapter or not _run_still_current():
+                    return
+                if not _bg_review_release.is_set():
+                    with _bg_review_pending_lock:
+                        if not _bg_review_release.is_set():
+                            _bg_review_pending_proposals.append(dict(proposal))
+                            return
+                _deliver_bg_review_proposal(dict(proposal))
+
+            agent.background_review_proposal_callback = _bg_review_skill_proposal_send
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
             if _status_adapter and session_key:

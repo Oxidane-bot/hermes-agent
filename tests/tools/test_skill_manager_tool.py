@@ -15,6 +15,10 @@ from tools.skill_manager_tool import (
     _find_skill,
     _resolve_skill_dir,
     _create_skill,
+    _propose_create_skill,
+    _approve_skill_proposal,
+    _reject_skill_proposal,
+    _load_skill_proposal,
     _edit_skill,
     _patch_skill,
     _delete_skill,
@@ -244,6 +248,63 @@ class TestCreateSkill:
         assert result["success"] is False
         assert f"Invalid category '{outside}'" in result["error"]
         assert not (outside / "my-skill" / "SKILL.md").exists()
+
+
+class TestSkillProposalCreate:
+    def test_propose_create_writes_draft_only(self, tmp_path):
+        proposals = tmp_path / "proposals"
+        with _skill_dir(tmp_path / "skills"), \
+             patch("tools.skill_manager_tool._skill_proposals_dir", return_value=proposals):
+            result = _propose_create_skill("draft-skill", VALID_SKILL_CONTENT)
+
+        assert result["success"] is True
+        proposal_id = result["proposal_id"]
+        assert (proposals / proposal_id / "SKILL.md").exists()
+        assert not (tmp_path / "skills" / "draft-skill").exists()
+
+    def test_propose_create_rejects_invalid_name_and_content(self, tmp_path):
+        proposals = tmp_path / "proposals"
+        with _skill_dir(tmp_path / "skills"), \
+             patch("tools.skill_manager_tool._skill_proposals_dir", return_value=proposals):
+            bad_name = _propose_create_skill("Bad Name", VALID_SKILL_CONTENT)
+            bad_content = _propose_create_skill("draft-skill", "no frontmatter")
+
+        assert bad_name["success"] is False
+        assert bad_content["success"] is False
+        assert not proposals.exists()
+
+    def test_approve_promotes_to_live_skill_and_marks_agent_created(self, tmp_path):
+        skills = tmp_path / "skills"
+        proposals = tmp_path / "proposals"
+        with _skill_dir(skills), \
+             patch("tools.skill_manager_tool._skill_proposals_dir", return_value=proposals):
+            proposal = _propose_create_skill("draft-skill", VALID_SKILL_CONTENT)
+            proposal_id = proposal["proposal_id"]
+            result = _approve_skill_proposal(proposal_id)
+            loaded_after = _load_skill_proposal(proposal_id)
+            from tools.skill_usage import load_usage
+            usage = load_usage()
+
+        assert result["success"] is True
+        assert (skills / "draft-skill" / "SKILL.md").exists()
+        assert loaded_after["success"] is False
+        assert loaded_after["status"] == "approved"
+        assert usage["draft-skill"]["created_by"] == "agent"
+
+    def test_reject_archives_without_creating_live_skill(self, tmp_path):
+        skills = tmp_path / "skills"
+        proposals = tmp_path / "proposals"
+        with _skill_dir(skills), \
+             patch("tools.skill_manager_tool._skill_proposals_dir", return_value=proposals):
+            proposal = _propose_create_skill("draft-skill", VALID_SKILL_CONTENT)
+            proposal_id = proposal["proposal_id"]
+            result = _reject_skill_proposal(proposal_id)
+            loaded_after = _load_skill_proposal(proposal_id)
+
+        assert result["success"] is True
+        assert not (skills / "draft-skill").exists()
+        assert loaded_after["success"] is False
+        assert loaded_after["status"] == "rejected"
 
 
 class TestEditSkill:
@@ -549,8 +610,8 @@ class TestSkillManageDispatcher:
         rec = usage.get("test-skill") or {}
         assert rec.get("created_by") in {None, "", False}
 
-    def test_create_from_background_review_marks_agent_created(self, tmp_path):
-        """Background-review fork creates ARE marked as agent-created."""
+    def test_create_from_background_review_is_rejected(self, tmp_path):
+        """Background-review fork must propose new skills instead of creating live ones."""
         from tools.skill_provenance import set_current_write_origin, BACKGROUND_REVIEW
         token = set_current_write_origin(BACKGROUND_REVIEW)
         try:
@@ -558,14 +619,24 @@ class TestSkillManageDispatcher:
                 raw = skill_manage(
                     action="create", name="review-sediment", content=VALID_SKILL_CONTENT
                 )
-                from tools.skill_usage import load_usage
-                usage = load_usage()
         finally:
             from tools.skill_provenance import reset_current_write_origin
             reset_current_write_origin(token)
         result = json.loads(raw)
+        assert result["success"] is False
+        assert "propose_create" in result["error"]
+
+    def test_propose_create_via_dispatcher(self, tmp_path):
+        proposals = tmp_path / "proposals"
+        with _skill_dir(tmp_path / "skills"), \
+             patch("tools.skill_manager_tool._skill_proposals_dir", return_value=proposals):
+            raw = skill_manage(
+                action="propose_create", name="review-sediment", content=VALID_SKILL_CONTENT
+            )
+        result = json.loads(raw)
         assert result["success"] is True
-        assert usage["review-sediment"]["created_by"] == "agent"
+        assert result["action"] == "skill_proposal"
+        assert (proposals / result["proposal_id"] / "SKILL.md").exists()
 
     def test_delete_via_dispatcher_threads_absorbed_into(self, tmp_path):
         # Dispatcher must plumb absorbed_into through to _delete_skill so the

@@ -2044,6 +2044,22 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def send_skill_proposal(
+        self,
+        chat_id: str,
+        proposal: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a skill-proposal approval UI.
+
+        Platforms with inline-button support should override this and route
+        approval/rejection callbacks to ``/skill-proposal approve <id>`` and
+        ``/skill-proposal reject <id>`` semantics. Platforms without buttons
+        return ``success=False`` so the gateway can fall back to plain text
+        instructions.
+        """
+        return SendResult(success=False, error="Not supported")
+
     async def send_clarify(
         self,
         chat_id: str,

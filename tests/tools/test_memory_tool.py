@@ -18,6 +18,10 @@ from tools.memory_tool import (
 # =========================================================================
 
 class TestMemorySchema:
+    def test_schema_exposes_read_action(self):
+        actions = MEMORY_SCHEMA["parameters"]["properties"]["action"]["enum"]
+        assert "read" in actions
+
     def test_discourages_diary_style_task_logs(self):
         description = MEMORY_SCHEMA["description"]
         assert "Do NOT save task progress" in description
@@ -352,6 +356,24 @@ class TestMemoryStoreRemove:
         assert result["success"] is False
 
 
+class TestMemoryStoreRead:
+    def test_read_returns_current_entries(self, store):
+        store.add("memory", "stable fact")
+        result = store.read("memory")
+        assert result["success"] is True
+        assert result["message"] == "Entries read."
+        assert result["entries"] == ["stable fact"]
+
+    def test_read_does_not_mutate_file(self, store):
+        store.add("memory", "stable fact")
+        path = store._path_for("memory")
+        before = path.read_text(encoding="utf-8")
+        result = store.read("memory")
+        after = path.read_text(encoding="utf-8")
+        assert result["success"] is True
+        assert after == before
+
+
 class TestMemoryStorePersistence:
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
@@ -416,6 +438,12 @@ class TestMemoryToolDispatcher:
     def test_add_via_tool(self, store):
         result = json.loads(memory_tool(action="add", target="memory", content="via tool", store=store))
         assert result["success"] is True
+
+    def test_read_via_tool(self, store):
+        store.add("memory", "via read")
+        result = json.loads(memory_tool(action="read", target="memory", store=store))
+        assert result["success"] is True
+        assert result["entries"] == ["via read"]
 
     def test_replace_requires_old_text(self, store):
         result = json.loads(memory_tool(action="replace", content="new", store=store))

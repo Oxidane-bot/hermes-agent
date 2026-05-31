@@ -32,213 +32,125 @@ logger = logging.getLogger(__name__)
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
 _MEMORY_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Focus on:\n"
-    "1. Has the user revealed things about themselves — their persona, desires, "
-    "preferences, or personal details worth remembering?\n"
-    "2. Has the user expressed expectations about how you should behave, their work "
-    "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "Review the conversation above and conservatively decide whether a durable "
+    "memory update is warranted. 'Nothing to save.' is a valid successful result.\n\n"
+    "Before changing a target, read it with memory(action='read', target=...).\n\n"
+    "Durability gates:\n"
+    "1. USER profile is only for stable user identity and long-lived preferences: "
+    "name, role, timezone, communication style, or explicit standing preferences.\n"
+    "2. MEMORY is only for durable environment/runtime facts: stable project paths, "
+    "configured tools, reusable local conventions, or long-lived setup facts.\n"
+    "3. Do not save task progress, one-off outcomes, transient failures, or "
+    "skill-specific operational facts to global memory or the user profile.\n"
+    "4. If the lesson is procedural, patch an existing skill or propose a new skill; "
+    "do not put procedural skill instructions in memory.\n\n"
+    "If nothing passes these gates, say exactly 'Nothing to save.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be "
-    "ACTIVE — most sessions produce at least one skill update, even if "
-    "small. A pass that does nothing is a missed learning opportunity, "
-    "not a neutral outcome.\n\n"
-    "Target shape of the library: CLASS-LEVEL skills, each with a rich "
-    "SKILL.md and a `references/` directory for session-specific detail. "
-    "Not a long flat list of narrow one-session-one-skill entries. This "
-    "shapes HOW you update, not WHETHER you update.\n\n"
-    "Signals to look for (any one of these warrants action):\n"
-    "  • User corrected your style, tone, format, legibility, or "
-    "verbosity. Frustration signals like 'stop doing X', 'this is too "
-    "verbose', 'don't format like this', 'why are you explaining', "
-    "'just give me the answer', 'you always do Y and I hate it', or an "
-    "explicit 'remember this' are FIRST-CLASS skill signals, not just "
-    "memory signals. Update the relevant skill(s) to embed the "
-    "preference so the next session starts already knowing.\n"
-    "  • User corrected your workflow, approach, or sequence of steps. "
-    "Encode the correction as a pitfall or explicit step in the skill "
-    "that governs that class of task.\n"
-    "  • Non-trivial technique, fix, workaround, debugging path, or "
-    "tool-usage pattern emerged that a future session would benefit "
-    "from. Capture it.\n"
-    "  • A skill that got loaded or consulted this session turned out "
-    "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-    "Preference order — prefer the earliest action that fits, but do "
-    "pick one when a signal above fired:\n"
-    "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
-    "conversation for skills the user loaded via /skill-name or you "
-    "read via skill_view. If any of them covers the territory of the "
-    "new learning, PATCH that one first. It is the skill that was in "
-    "play, so it's the right one to extend.\n"
-    "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). "
-    "If no loaded skill fits but an existing class-level skill does, "
-    "patch it. Add a subsection, a pitfall, or broaden a trigger.\n"
-    "  3. ADD A SUPPORT FILE under an existing umbrella. Skills can be "
-    "packaged with three kinds of support files — use the right "
-    "directory per kind:\n"
-    "     • `references/<topic>.md` — session-specific detail (error "
-    "transcripts, reproduction recipes, provider quirks) AND "
-    "condensed knowledge banks: quoted research, API docs, external "
-    "authoritative excerpts, or domain notes you found while working "
-    "on the problem. Write it concise and for the value of the task, "
-    "not as a full mirror of upstream docs.\n"
-    "     • `templates/<name>.<ext>` — starter files meant to be "
-    "copied and modified (boilerplate configs, scaffolding, a "
-    "known-good example the agent can `reproduce with modifications`).\n"
-    "     • `scripts/<name>.<ext>` — statically re-runnable actions "
-    "the skill can invoke directly (verification scripts, fixture "
-    "generators, deterministic probes, anything the agent should run "
-    "rather than hand-type each time).\n"
-    "     Add support files via skill_manage action=write_file with "
-    "file_path starting 'references/', 'templates/', or 'scripts/'. "
-    "The umbrella's SKILL.md should gain a one-line pointer to any "
-    "new support file so future agents know it exists.\n"
-    "  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL when no existing "
-    "skill covers the class. The name MUST be at the class level. "
-    "The name MUST NOT be a specific PR number, error string, feature "
-    "codename, library-alone name, or 'fix-X / debug-Y / audit-Z-today' "
-    "session artifact. If the proposed name only makes sense for "
-    "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
-    "User-preference embedding (important): when the user expressed a "
-    "style/format/workflow preference, the update belongs in the "
-    "SKILL.md body, not just in memory. Memory captures 'who the user "
-    "is and what the current situation and state of your operations "
-    "are'; skills capture 'how to do this class of task for this "
-    "user'. When they complain about how you handled a task, the "
-    "skill that governs that task needs to carry the lesson.\n\n"
-    "If you notice two existing skills that overlap, note it in your "
-    "reply — the background curator handles consolidation at scale.\n\n"
-    "Protected skills (DO NOT edit these):\n"
-    "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
-    "  • Hub-installed skills (installed via 'hermes skills install').\n"
-    "Pinned skills (marked via 'hermes curator pin') CAN be improved — "
-    "pin only blocks deletion/archive/consolidation by the curator, not "
-    "content updates. Patch them when a pitfall or missing step turns up, "
-    "same as any other agent-created skill.\n"
-    "If the only skills that need updating are protected, say\n"
-    "'Nothing to save.' and stop.\n\n"
-    "Do NOT capture (these become persistent self-imposed constraints "
-    "that bite you later when the environment changes):\n"
-    "  • Environment-dependent failures: missing binaries, fresh-install "
-    "errors, post-migration path mismatches, 'command not found', "
-    "unconfigured credentials, uninstalled packages. The user can fix "
-    "these — they are not durable rules.\n"
-    "  • Negative claims about tools or features ('browser tools do not "
-    "work', 'X tool is broken', 'cannot use Y from execute_code'). These "
-    "harden into refusals the agent cites against itself for months "
-    "after the actual problem was fixed.\n"
-    "  • Session-specific transient errors that resolved before the "
-    "conversation ended. If retrying worked, the lesson is the retry "
-    "pattern, not the original failure.\n"
-    "  • One-off task narratives. A user asking 'summarize today's "
-    "market' or 'analyze this PR' is not a class of work that warrants "
-    "a skill.\n\n"
-    "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) under an existing setup or "
-    "troubleshooting skill — never 'this tool does not work' as a "
-    "standalone constraint.\n\n"
-    "'Nothing to save.' is a real option but should NOT be the "
-    "default. If the session ran smoothly with no corrections and "
-    "produced no new technique, just say 'Nothing to save.' and stop. "
-    "Otherwise, act."
+    "Review the conversation above and conservatively decide whether the skill "
+    "library needs a durable update. 'Nothing to save.' is a valid successful "
+    "result and should be used whenever no durable skill lesson exists.\n\n"
+    "Read before write: use memory(action='read', target='memory') or "
+    "memory(action='read', target='user') before relying on or changing those "
+    "stores. Use skills_list and skill_view before patching a skill or proposing "
+    "a new one.\n\n"
+    "Durability gates:\n"
+    "  • USER profile is only for stable user identity and long-lived preferences.\n"
+    "  • MEMORY is only for durable environment/runtime facts.\n"
+    "  • Skill-specific operational facts, workflow steps, tool recipes, and "
+    "debugging procedures must not be saved to global memory or the user profile.\n"
+    "  • New skills must be proposed with skill_manage(action='propose_create'), "
+    "not directly created. The user approves or rejects the proposal later.\n\n"
+    "When there is durable skill signal, prefer the earliest safe action that fits:\n"
+    "  1. PATCH A CURRENTLY-LOADED SKILL. Look for skills loaded via /skill-name "
+    "or inspected via skill_view. If one covers the learning, patch that skill.\n"
+    "  2. PATCH AN EXISTING UMBRELLA. Use skills_list + skill_view to find a "
+    "class-level skill and patch it.\n"
+    "  3. ADD A SUPPORT FILE under an existing umbrella with "
+    "skill_manage action=write_file. Use references/<topic>.md for concise "
+    "knowledge/research/API-doc notes, templates/<name>.<ext> for starter files "
+    "meant to be copied and modified, and scripts/<name>.<ext> for statically "
+    "re-runnable verification/probe actions. Add a one-line pointer in SKILL.md.\n"
+    "  4. PROPOSE A NEW CLASS-LEVEL UMBRELLA SKILL only when no existing skill "
+    "covers the class. Use skill_manage(action='propose_create', name=..., "
+    "content=..., category=...). The name MUST be class level and MUST NOT be a "
+    "PR number, exact error string, feature codename, library-alone name, or "
+    "'fix-X / debug-Y / audit-Z-today' session artifact.\n\n"
+    "User-preference corrections about style, format, tone, verbosity, legibility, "
+    "or workflow (for example 'stop doing X', 'don't format like this', or "
+    "'I hate when you Y') are first-class skill signals only when they apply to "
+    "a repeatable task class. Put durable preference lessons in SKILL.md, not only "
+    "memory; memory says who the user is, skills say how to do this class of task.\n\n"
+    "If you notice overlapping existing skills, mention it in your reply; the "
+    "background curator handles consolidation.\n\n"
+    "Protected skills (DO NOT edit these): bundled skills shipped with Hermes and "
+    "hub-installed skills. Pinned skills may be patched but not deleted. If only "
+    "protected skills would need changes, say 'Nothing to save.' and stop.\n\n"
+    "Do NOT capture as skills:\n"
+    "  • Environment-dependent failures: missing binaries, fresh-install errors, "
+    "post-migration path mismatches, command not found, unconfigured credentials, "
+    "or uninstalled packages.\n"
+    "  • Negative claims about tools or features ('browser tools do not work', "
+    "'X tool is broken', 'cannot use Y').\n"
+    "  • Session-specific transient errors that resolved before the conversation ended.\n"
+    "  • One-off task narratives.\n"
+    "If a tool failed because of setup state, capture the fix under an existing "
+    "setup/troubleshooting skill only when it is durable; capture the fix, not "
+    "the failure as a constraint.\n\n"
+    "If no durable skill update or proposal passes these gates, say exactly "
+    "'Nothing to save.' and stop."
 )
 
 _COMBINED_REVIEW_PROMPT = (
-    "Review the conversation above and update two things:\n\n"
-    "**Memory**: who the user is. Did the user reveal persona, "
-    "desires, preferences, personal details, or expectations about "
-    "how you should behave? Save facts about the user and durable "
-    "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most "
-    "sessions produce at least one skill update. A pass that does "
-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
-    "Target shape of the skill library: CLASS-LEVEL skills with a rich "
-    "SKILL.md and a `references/` directory for session-specific detail. "
-    "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-    "Signals that warrant a skill update (any one is enough):\n"
-    "  • User corrected your style, tone, format, legibility, "
-    "verbosity, or approach. Frustration is a FIRST-CLASS skill "
-    "signal, not just a memory signal. 'stop doing X', 'don't format "
-    "like this', 'I hate when you Y' — embed the lesson in the skill "
-    "that governs that task so the next session starts fixed.\n"
-    "  • Non-trivial technique, fix, workaround, or debugging path "
-    "emerged.\n"
-    "  • A skill that was loaded or consulted turned out wrong, "
-    "missing, or outdated — patch it now.\n\n"
-    "Preference order for skills — pick the earliest that fits:\n"
-    "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
-    "loaded via /skill-name or skill_view in the conversation. If one "
-    "of them covers the learning, PATCH it first. It was in play; "
-    "it's the right place.\n"
-    "  2. UPDATE AN EXISTING UMBRELLA (skills_list + skill_view to "
-    "find the right one). Patch it.\n"
-    "  3. ADD A SUPPORT FILE under an existing umbrella via "
-    "skill_manage action=write_file. Three kinds: "
-    "`references/<topic>.md` for session-specific detail OR condensed "
-    "knowledge banks (quoted research, API docs excerpts, domain "
-    "notes) written concise and task-focused; `templates/<name>.<ext>` "
-    "for starter files meant to be copied and modified; "
-    "`scripts/<name>.<ext>` for statically re-runnable actions "
-    "(verification, fixture generators, probes). Add a one-line "
-    "pointer in SKILL.md so future agents find them.\n"
-    "  4. CREATE A NEW CLASS-LEVEL UMBRELLA when nothing exists. "
-    "Name at the class level — NOT a PR number, error string, "
-    "codename, library-alone name, or 'fix-X / debug-Y' session "
-    "artifact. If the name only fits today's task, fall back to (1), "
-    "(2), or (3).\n\n"
-    "User-preference embedding: when the user complains about how "
-    "you handled a task, update the skill that governs that task — "
-    "memory alone isn't enough. Memory says 'who the user is and "
-    "what the current situation and state of your operations are'; "
-    "skills say 'how to do this class of task for this user'. Both "
-    "should carry user-preference lessons when relevant.\n\n"
-    "If you notice overlapping existing skills, mention it — the "
-    "background curator handles consolidation.\n\n"
-    "Protected skills (DO NOT edit these):\n"
-    "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
-    "  • Hub-installed skills (installed via 'hermes skills install').\n"
-    "Pinned skills (marked via 'hermes curator pin') CAN be improved — "
-    "pin only blocks deletion/archive/consolidation by the curator, not "
-    "content updates. Patch them when a pitfall or missing step turns up, "
-    "same as any other agent-created skill.\n"
-    "If the only skills that need updating are protected, say\n"
-    "'Nothing to save.' and stop.\n\n"
-    "Do NOT capture as skills (these become persistent self-imposed "
-    "constraints that bite you later when the environment changes):\n"
-    "  • Environment-dependent failures: missing binaries, fresh-install "
-    "errors, post-migration path mismatches, 'command not found', "
-    "unconfigured credentials, uninstalled packages. The user can fix "
-    "these — they are not durable rules.\n"
-    "  • Negative claims about tools or features ('browser tools do not "
-    "work', 'X tool is broken', 'cannot use Y from execute_code'). These "
-    "harden into refusals the agent cites against itself for months "
-    "after the actual problem was fixed.\n"
-    "  • Session-specific transient errors that resolved before the "
-    "conversation ended. If retrying worked, the lesson is the retry "
-    "pattern, not the original failure.\n"
-    "  • One-off task narratives. A user asking 'summarize today's "
-    "market' or 'analyze this PR' is not a class of work that warrants "
-    "a skill.\n\n"
-    "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) under an existing setup or "
-    "troubleshooting skill — never 'this tool does not work' as a "
-    "standalone constraint.\n\n"
-    "Act on whichever of the two dimensions has real signal. If "
-    "genuinely nothing stands out on either, say 'Nothing to save.' "
-    "and stop — but don't reach for that conclusion as a default."
+    "Review the conversation above and conservatively decide whether either "
+    "memory or skills need a durable update. 'Nothing to save.' is a valid "
+    "successful result.\n\n"
+    "Read before write: use memory(action='read', target='memory'/'user') before "
+    "changing or relying on a memory target, and use skills_list + skill_view "
+    "before patching skills or proposing a new one.\n\n"
+    "**Memory**: save only durable facts. USER profile is only for stable user "
+    "identity and long-lived preferences. MEMORY is only for durable "
+    "environment/runtime facts. Do not save task progress, one-off outcomes, "
+    "transient failures, or skill-specific operational facts to global memory or "
+    "the user profile. Use the memory tool only when a fact passes those gates.\n\n"
+    "**Skills**: skills say how to do a repeatable class of task. New skills must "
+    "be proposed with skill_manage(action='propose_create'), not directly created.\n\n"
+    "Skill action preference order:\n"
+    "  1. PATCH A CURRENTLY-LOADED SKILL. Check /skill-name loads and skill_view.\n"
+    "  2. PATCH AN EXISTING UMBRELLA found via skills_list + skill_view.\n"
+    "  3. ADD A SUPPORT FILE under an existing umbrella: references/<topic>.md for "
+    "knowledge/research/API-doc notes, templates/<name>.<ext> for starter files "
+    "to copy/modify, scripts/<name>.<ext> for re-runnable verification/probes; "
+    "add a SKILL.md pointer.\n"
+    "  4. PROPOSE A NEW CLASS-LEVEL UMBRELLA only when nothing exists. The name "
+    "MUST be class level and MUST NOT be a PR number, exact error string, feature "
+    "codename, library-alone name, or today's fix/debug/audit artifact.\n\n"
+    "User corrections about style, format, tone, verbosity, legibility, or "
+    "workflow (for example 'stop doing X', 'don't format like this', or 'I hate "
+    "when you Y') are first-class skill signals only when repeatable. Put durable "
+    "task-class preference lessons in SKILL.md; memory says who the user is and "
+    "skills say how to do the task class.\n\n"
+    "If existing skills overlap, mention it for the curator instead of consolidating.\n\n"
+    "Protected skills (DO NOT edit): bundled and hub-installed skills. Pinned "
+    "skills may be patched but not deleted. If only protected skills would need "
+    "changes, say 'Nothing to save.' and stop.\n\n"
+    "Do NOT capture as skills: environment-dependent failures (missing binaries, "
+    "fresh-install errors, command not found, unconfigured credentials, "
+    "uninstalled packages), negative claims ('do not work', 'is broken'), "
+    "session-specific transient errors, or one-off task narratives. Capture the "
+    "fix under an existing setup/troubleshooting skill only when durable; capture "
+    "the fix, not the failure.\n\n"
+    "Act only on durable signal. If nothing passes the gates, say exactly "
+    "'Nothing to save.' and stop."
 )
 
 
-
-def summarize_background_review_actions(
+def summarize_background_review_action_details(
     review_messages: List[Dict],
     prior_snapshot: List[Dict],
-) -> List[str]:
-    """Build the human-facing action summary for a background review pass.
+) -> List[Dict[str, Any]]:
+    """Build structured successful-action details for a background review pass.
 
     Walks the review agent's session messages and collects "successful tool
     action" descriptions to surface to the user (e.g. "Memory updated").
@@ -262,7 +174,7 @@ def summarize_background_review_actions(
             if isinstance(content, str):
                 existing_tool_contents.add(content)
 
-    actions: List[str] = []
+    actions: List[Dict[str, Any]] = []
     for msg in review_messages or []:
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
@@ -281,20 +193,42 @@ def summarize_background_review_actions(
             continue
         message = data.get("message", "")
         target = data.get("target", "")
-        if "created" in message.lower():
-            actions.append(message)
-        elif "updated" in message.lower():
-            actions.append(message)
-        elif "added" in message.lower() or (target and "add" in message.lower()):
+        lower_message = message.lower()
+        if data.get("action") == "skill_proposal" or data.get("proposal_id"):
+            actions.append({
+                "kind": "skill_proposal",
+                "summary": message or f"Skill proposal '{data.get('name', '')}' created.",
+                "proposal_id": data.get("proposal_id", ""),
+                "name": data.get("name", ""),
+                "category": data.get("category"),
+                "proposal_path": data.get("proposal_path"),
+            })
+        elif "created" in lower_message:
+            actions.append({"kind": "skill_created", "summary": message})
+        elif "updated" in lower_message or "patched" in lower_message or "written" in lower_message:
+            actions.append({"kind": "skill_patch", "summary": message})
+        elif "added" in lower_message or (target and "add" in lower_message):
             label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-            actions.append(f"{label} updated")
+            actions.append({"kind": "memory_update", "summary": f"{label} updated", "target": target})
         elif "Entry added" in message:
             label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-            actions.append(f"{label} updated")
-        elif "removed" in message.lower() or "replaced" in message.lower():
+            actions.append({"kind": "memory_update", "summary": f"{label} updated", "target": target})
+        elif "removed" in lower_message or "replaced" in lower_message:
             label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-            actions.append(f"{label} updated")
+            actions.append({"kind": "memory_update", "summary": f"{label} updated", "target": target})
     return actions
+
+
+def summarize_background_review_actions(
+    review_messages: List[Dict],
+    prior_snapshot: List[Dict],
+) -> List[str]:
+    """Build the legacy string action summary for CLI/TUI compatibility."""
+    return [
+        str(action.get("summary", ""))
+        for action in summarize_background_review_action_details(review_messages, prior_snapshot)
+        if action.get("summary")
+    ]
 
 
 def build_memory_write_metadata(
@@ -508,10 +442,15 @@ def _run_review_in_thread(
         # the review agent inherits that history and would otherwise
         # re-surface stale "created"/"updated" messages from the prior
         # conversation as if they just happened (issue #14944).
-        actions = summarize_background_review_actions(
+        action_details = summarize_background_review_action_details(
             review_messages,
             messages_snapshot,
         )
+        actions = [
+            str(action.get("summary", ""))
+            for action in action_details
+            if action.get("summary")
+        ]
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
@@ -524,6 +463,21 @@ def _run_review_in_thread(
                     _bg_cb(
                         f"💾 Self-improvement review: {summary}"
                     )
+                except Exception:
+                    pass
+
+        proposal_cb = getattr(agent, "background_review_proposal_callback", None)
+        if proposal_cb:
+            seen_proposals = set()
+            for action in action_details:
+                if action.get("kind") != "skill_proposal":
+                    continue
+                proposal_id = str(action.get("proposal_id") or "")
+                if not proposal_id or proposal_id in seen_proposals:
+                    continue
+                seen_proposals.add(proposal_id)
+                try:
+                    proposal_cb(action)
                 except Exception:
                     pass
 
@@ -593,5 +547,6 @@ __all__ = [
     "_COMBINED_REVIEW_PROMPT",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
+    "summarize_background_review_action_details",
     "build_memory_write_metadata",
 ]

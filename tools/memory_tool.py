@@ -405,6 +405,15 @@ class MemoryStore:
 
         return self._success_response(target, "Entry replaced.")
 
+    def read(self, target: str) -> Dict[str, Any]:
+        """Return the latest entries for *target* without mutating files."""
+        path = self._path_for(target)
+        with self._file_lock(path):
+            fresh = self._read_file(path)
+            fresh = list(dict.fromkeys(fresh))
+            self._set_entries(target, fresh)
+        return self._success_response(target, "Entries read.")
+
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         old_text = old_text.strip()
@@ -618,7 +627,10 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
-    if action == "add":
+    if action == "read":
+        result = store.read(target)
+
+    elif action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
         result = store.add(target, content)
@@ -636,7 +648,7 @@ def memory_tool(
         result = store.remove(target, old_text)
 
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: read, add, replace, remove", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -671,7 +683,8 @@ MEMORY_SCHEMA = {
         "TWO TARGETS:\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
-        "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
+        "ACTIONS: read (inspect current entries without mutating files), "
+        "add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
@@ -680,8 +693,8 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform."
+                "enum": ["read", "add", "replace", "remove"],
+                "description": "The action to perform. Use read before add/replace/remove when deciding whether a durable update is needed."
             },
             "target": {
                 "type": "string",
@@ -690,7 +703,7 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace'."
+                "description": "The entry content. Required for 'add' and 'replace'; ignored for 'read'."
             },
             "old_text": {
                 "type": "string",
@@ -718,7 +731,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

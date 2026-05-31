@@ -13,6 +13,7 @@ broad and declarative. Skills are narrow and actionable.
 
 Actions:
   create     -- Create a new skill (SKILL.md + directory structure)
+  propose_create -- Validate a new skill draft and store it for user approval
   edit       -- Replace the SKILL.md content of a user skill (full rewrite)
   patch      -- Targeted find-and-replace within SKILL.md or any supporting file
   delete     -- Remove a user skill entirely
@@ -38,6 +39,8 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from hermes_constants import get_hermes_home, display_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
@@ -273,6 +276,31 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     if category:
         return SKILLS_DIR / category / name
     return SKILLS_DIR / name
+
+
+def _skill_proposals_dir() -> Path:
+    """Return the profile-scoped storage root for draft skill proposals."""
+    return get_hermes_home() / "skill_proposals"
+
+
+def _skill_proposal_archive_dir() -> Path:
+    return _skill_proposals_dir() / "archive"
+
+
+def _proposal_dir(proposal_id: str) -> Path:
+    return _skill_proposals_dir() / proposal_id
+
+
+def _proposal_status_dir(status: str) -> Path:
+    return _skill_proposal_archive_dir() / status
+
+
+def _validate_proposal_id(proposal_id: str) -> Optional[str]:
+    if not proposal_id:
+        return "proposal_id is required."
+    if not re.match(r"^[a-zA-Z0-9._-]{6,80}$", proposal_id):
+        return f"Invalid proposal_id '{proposal_id}'."
+    return None
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
@@ -528,6 +556,174 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
     return result
+
+
+def _propose_create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+    """Validate a new skill and write a draft proposal without activating it."""
+    err = _validate_name(name)
+    if err:
+        return {"success": False, "error": err}
+
+    err = _validate_category(category)
+    if err:
+        return {"success": False, "error": err}
+
+    err = _validate_frontmatter(content)
+    if err:
+        return {"success": False, "error": err}
+
+    err = _validate_content_size(content)
+    if err:
+        return {"success": False, "error": err}
+
+    existing = _find_skill(name)
+    if existing:
+        return {
+            "success": False,
+            "error": f"A skill named '{name}' already exists at {existing['path']}. Patch it instead.",
+        }
+
+    proposal_id = uuid.uuid4().hex[:12]
+    proposal_dir = _proposal_dir(proposal_id)
+    while proposal_dir.exists():
+        proposal_id = uuid.uuid4().hex[:12]
+        proposal_dir = _proposal_dir(proposal_id)
+    proposal_dir.mkdir(parents=True, exist_ok=False)
+
+    metadata = {
+        "proposal_id": proposal_id,
+        "status": "pending",
+        "action": "propose_create",
+        "name": name,
+        "category": category or "",
+        "created_at": int(time.time()),
+    }
+    _atomic_write_text(proposal_dir / "SKILL.md", content)
+    _atomic_write_text(
+        proposal_dir / "proposal.json",
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+    )
+    return {
+        "success": True,
+        "action": "skill_proposal",
+        "proposal_id": proposal_id,
+        "status": "pending",
+        "name": name,
+        "category": category or None,
+        "message": (
+            f"Skill proposal '{name}' created for user approval "
+            f"(proposal_id={proposal_id})."
+        ),
+        "proposal_path": str(proposal_dir),
+    }
+
+
+def _load_skill_proposal(proposal_id: str) -> Dict[str, Any]:
+    """Load a pending proposal by id."""
+    err = _validate_proposal_id(proposal_id)
+    if err:
+        return {"success": False, "error": err}
+
+    proposal_dir = _proposal_dir(proposal_id)
+    if not proposal_dir.exists():
+        for status in ("approved", "rejected"):
+            archived = _proposal_status_dir(status) / proposal_id
+            if archived.exists():
+                return {
+                    "success": False,
+                    "error": f"Skill proposal '{proposal_id}' is already {status}.",
+                    "status": status,
+                }
+        return {"success": False, "error": f"Skill proposal '{proposal_id}' not found."}
+
+    meta_path = proposal_dir / "proposal.json"
+    skill_md = proposal_dir / "SKILL.md"
+    if not meta_path.exists() or not skill_md.exists():
+        return {"success": False, "error": f"Skill proposal '{proposal_id}' is incomplete."}
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {"success": False, "error": f"Skill proposal '{proposal_id}' metadata is invalid: {exc}"}
+    metadata["content"] = skill_md.read_text(encoding="utf-8")
+    metadata["proposal_path"] = str(proposal_dir)
+    return {"success": True, **metadata}
+
+
+def _archive_skill_proposal(proposal_id: str, status: str) -> Optional[str]:
+    """Move a resolved proposal to archive/<status>/ and return the archive path."""
+    src = _proposal_dir(proposal_id)
+    if not src.exists():
+        return None
+    dst_root = _proposal_status_dir(status)
+    dst_root.mkdir(parents=True, exist_ok=True)
+    dst = dst_root / proposal_id
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.move(str(src), str(dst))
+    meta_path = dst / "proposal.json"
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        metadata = {"proposal_id": proposal_id}
+    metadata["status"] = status
+    metadata["resolved_at"] = int(time.time())
+    _atomic_write_text(meta_path, json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
+    return str(dst)
+
+
+def _approve_skill_proposal(proposal_id: str) -> Dict[str, Any]:
+    """Promote a pending skill proposal into the live skill library."""
+    loaded = _load_skill_proposal(proposal_id)
+    if not loaded.get("success"):
+        return loaded
+    name = str(loaded.get("name", ""))
+    content = str(loaded.get("content", ""))
+    category = str(loaded.get("category") or "") or None
+
+    result = _create_skill(name, content, category)
+    if not result.get("success"):
+        result["proposal_id"] = proposal_id
+        return result
+
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    except Exception:
+        pass
+    try:
+        from tools.skill_usage import mark_agent_created
+        mark_agent_created(name)
+    except Exception:
+        pass
+
+    archive_path = _archive_skill_proposal(proposal_id, "approved")
+    return {
+        "success": True,
+        "action": "skill_proposal_approved",
+        "proposal_id": proposal_id,
+        "name": name,
+        "message": f"Skill proposal '{proposal_id}' approved; skill '{name}' created.",
+        "path": result.get("path"),
+        "skill_md": result.get("skill_md"),
+        "archive_path": archive_path,
+    }
+
+
+def _reject_skill_proposal(proposal_id: str) -> Dict[str, Any]:
+    """Reject and archive a pending skill proposal without touching live skills."""
+    loaded = _load_skill_proposal(proposal_id)
+    if not loaded.get("success"):
+        return loaded
+    name = str(loaded.get("name", ""))
+    archive_path = _archive_skill_proposal(proposal_id, "rejected")
+    return {
+        "success": True,
+        "action": "skill_proposal_rejected",
+        "proposal_id": proposal_id,
+        "name": name,
+        "message": f"Skill proposal '{proposal_id}' rejected; no live skill was created.",
+        "archive_path": archive_path,
+    }
 
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
@@ -831,9 +1027,24 @@ def skill_manage(
     Returns JSON string with results.
     """
     if action == "create":
+        try:
+            from tools.skill_provenance import is_background_review
+            if is_background_review():
+                return tool_error(
+                    "Background review must use action='propose_create' for new skills; "
+                    "live skill creation requires user approval.",
+                    success=False,
+                )
+        except Exception:
+            pass
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
         result = _create_skill(name, content, category)
+
+    elif action == "propose_create":
+        if not content:
+            return tool_error("content is required for 'propose_create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+        result = _propose_create_skill(name, content, category)
 
     elif action == "edit":
         if not content:
@@ -863,9 +1074,9 @@ def skill_manage(
         result = _remove_file(name, file_path)
 
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, propose_create, edit, patch, delete, write_file, remove_file"}
 
-    if result.get("success"):
+    if result.get("success") and action != "propose_create":
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -903,7 +1114,8 @@ SKILL_MANAGE_SCHEMA = {
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
         f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
-        "Actions: create (full SKILL.md + optional category), "
+        "Actions: create (foreground/user-directed full SKILL.md + optional category), "
+        "propose_create (background-review/new-skill draft that requires user approval), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
         "delete, write_file, remove_file.\n\n"
@@ -914,7 +1126,8 @@ SKILL_MANAGE_SCHEMA = {
         "(cron jobs that reference the old skill name, etc.) get updated "
         "correctly. The target you name in `absorbed_into` must already "
         "exist — create/patch the umbrella first, then delete.\n\n"
-        "Create when: complex task succeeded (5+ calls), errors overcome, "
+        "Use propose_create, not create, from background self-improvement review. "
+        "Create/propose when: complex task succeeded (5+ calls), errors overcome, "
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure.\n"
         "Update when: instructions stale/wrong, OS-specific failures, "
@@ -934,22 +1147,24 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": ["create", "propose_create", "patch", "edit", "delete", "write_file", "remove_file"],
                 "description": "The action to perform."
             },
             "name": {
                 "type": "string",
                 "description": (
                     "Skill name (lowercase, hyphens/underscores, max 64 chars). "
-                    "Must match an existing skill for patch/edit/delete/write_file/remove_file."
+                    "Must match an existing skill for patch/edit/delete/write_file/remove_file; "
+                    "must be a new class-level name for create/propose_create."
                 )
             },
             "content": {
                 "type": "string",
                 "description": (
                     "Full SKILL.md content (YAML frontmatter + markdown body). "
-                    "Required for 'create' and 'edit'. For 'edit', read the skill "
-                    "first with skill_view() and provide the complete updated text."
+                    "Required for 'create', 'propose_create', and 'edit'. "
+                    "For 'edit', read the skill first with skill_view() and "
+                    "provide the complete updated text."
                 )
             },
             "old_string": {
@@ -976,7 +1191,7 @@ SKILL_MANAGE_SCHEMA = {
                 "description": (
                     "Optional category/domain for organizing the skill (e.g., 'devops', "
                     "'data-science', 'mlops'). Creates a subdirectory grouping. "
-                    "Only used with 'create'."
+                    "Only used with 'create' and 'propose_create'."
                 )
             },
             "file_path": {
