@@ -23,17 +23,17 @@ summarizes what is special about this fork.
 - Keep the fork branch list small instead of mirroring old upstream PR/topic
   branches.
 
-## Fork-specific behavior
+## Maintained feature set
 
-| Area | What changed here |
-|---|---|
-| `/goal` loop | Goal state survives compression/session splits; the judge now requires concrete completion evidence instead of accepting bare “done” text; judge timeout is configurable for slower main-model verdicts. |
-| Voice messages | Platform voice notes are transcribed before the model sees them; the prompt now marks transcripts as fallible so the model can use context to infer intended meaning. Voice replies can also satisfy pending clarification prompts. |
-| Context compression | Checkpoint-framed v2 compaction is retained, with Codex Responses replay/recovery fixes and compatibility updates for upstream runtime changes. |
-| Messaging gateway | Attachment delivery failures are surfaced instead of hidden behind successful text delivery. Session/topic persistence fixes keep Telegram goal and compression flows coherent. |
-| Web/search tooling | Tavily multi-key pooling, cooldown, crawl auth, and merged provider documentation are kept as local operational improvements. |
-| Review safety | Background review can propose skills, but it cannot silently create or mutate the skills surface without approval. |
-| Fork maintenance | README, branch strategy, and local-change docs identify this as a needs-driven personal fork, not an upstream PR staging area. |
+| Feature | User-facing value | Representative commits |
+|---|---|---|
+| Goal automation | `/goal` survives session compression and stops on evidence of completion instead of looping on bare “done” text. The judge timeout is configurable, so the stronger main model can be used reliably. | `6f98baee4`, `abaa238fd` |
+| Voice message handling | Voice notes are delivered to the model as marked transcripts, not exact user wording. The model is prompted to treat ASR text as fallible and use conversation context; voice replies can also answer pending clarification prompts. | `2ab1f2c91`, `5fc9603ae` |
+| Long-session compaction | Compression produces structured handoff checkpoints that preserve the active task, current work state, files, tests, and remaining work. The request shape also keeps the system-prefix/prompt-cache behavior consistent instead of drifting after compaction. | `e2e898f60`, `60a518780`, `9bb825941` |
+| Codex Responses replay | Auxiliary compaction follows the same Responses-style replay shape as the main agent, preserving tool calls, function outputs, reasoning items, and timeouts/fallbacks instead of flattening the conversation into lossy text. | `60a518780`, `9bb825941` |
+| Attachment delivery reliability | When the agent references local files or `MEDIA:` paths, the gateway attempts native upload for supported files, including archives. If an attachment cannot be parsed or delivered, the user gets an explicit warning and lifecycle hooks see the turn as failed. | `4cab4b729` |
+| Web search credentials | Tavily can use a pool of API keys with fill-first selection and cooldown, keeping web search available when one key hits quota without wasting quota on background probes. | `e7c742a0c` |
+| Background review safety | Background review can collect memory and propose skills, but skill creation or mutation requires approval instead of happening silently from a non-blocking review thread. | `1c4de266c` |
 
 ## Branch model
 
@@ -66,11 +66,11 @@ for the exact policy.
 | `5fc9603ae` | Treats voice transcripts as fallible model context. |
 | `1c4de266c` | Requires approval before background review creates skills. |
 | `4cab4b729` | Makes attachment delivery failures visible. |
-| `9bb825941` | Keeps local checks aligned with current upstream runtime semantics. |
+| `9bb825941` | Keeps compaction and Responses replay compatible with the current upstream runtime. |
 | `e7c742a0c` | Keeps Tavily usable across pooled keys. |
 | `6f98baee4` | Preserves goals across compression session splits. |
 | `60a518780` | Keeps compaction robust through real Codex Responses replay. |
-| `e2e898f60` | Retains checkpoint-framed v2 context compaction. |
+| `e2e898f60` | Adds structured handoff checkpoints for long-session compaction. |
 
 ## Updating from upstream
 

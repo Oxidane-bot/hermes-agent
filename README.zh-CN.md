@@ -16,17 +16,17 @@
 - 让 fork-only 行为在以后更新上游代码前可以快速审计。
 - 保持 fork 分支列表很小，不再保留旧的上游 PR/topic 分支堆积。
 
-## 本 fork 的主要改动
+## 当前维护的功能
 
-| 领域 | 本 fork 做了什么 |
-|---|---|
-| `/goal` 循环 | goal 状态可跨压缩/会话切分保留；judge 需要具体完成证据，不再只凭“完成/停止”字样结束；judge timeout 可配置，适配较慢的主模型判断。 |
-| 语音消息 | 平台语音会先转写再交给模型；prompt 明确提醒转写可能有误，模型应结合上下文推断真实意图。语音回复也可以回应待澄清问题。 |
-| 上下文压缩 | 保留 checkpoint-framed v2 compaction，并维护 Codex Responses replay/recovery 与上游 runtime 兼容修复。 |
-| 消息网关 | 附件发送失败会显式暴露，不再被“文本发送成功”掩盖。Telegram goal、topic、compression 相关状态保持更稳定。 |
-| Web/search 工具 | 保留 Tavily 多 key 池、冷却、crawl auth，以及合并后的 provider 文档。 |
-| Review 安全边界 | 后台 review 可以提出 skill，但不能未经批准直接创建或修改 skill surface。 |
-| Fork 维护 | README、分支策略和本地变更文档都明确说明：这是按本地需求维护的个人 fork，不是上游 PR 暂存区。 |
+| 功能 | 对外表现 | 代表 commit |
+|---|---|---|
+| Goal 自动化 | `/goal` 可以跨会话压缩继续运行，并且根据具体完成证据停止，而不是只看到“完成/停止”字样就误判。judge timeout 可配置，方便稳定使用更强的主模型判断。 | `6f98baee4`, `abaa238fd` |
+| 语音消息处理 | 语音会以“转写文本”的身份交给模型，而不是当成用户精确打字。prompt 明确提醒 ASR 可能出错，需要结合上下文理解；语音回复也可以回答待澄清问题。 | `2ab1f2c91`, `5fc9603ae` |
+| 长会话压缩 | 压缩会生成结构化交接 checkpoint，保留当前任务、工作状态、文件、测试和剩余事项。请求形态也保持系统前缀/prompt-cache 行为一致，避免压缩后因为前缀差异导致上下文漂移。 | `e2e898f60`, `60a518780`, `9bb825941` |
+| Codex Responses replay | 辅助压缩沿用主 agent 的 Responses replay 形态，保留 tool call、function output、reasoning item、timeout/fallback，而不是把对话压平成容易丢信息的纯文本。 | `60a518780`, `9bb825941` |
+| 附件投递可靠性 | agent 输出本地文件或 `MEDIA:` 路径时，gateway 会尽量走平台原生上传，包含 archive 文件。附件无法解析或投递失败时，用户会收到明确提醒，生命周期 hook 也会把该轮视为失败。 | `4cab4b729` |
+| Web search 凭证池 | Tavily 支持多 API key、fill-first 选择和 cooldown；某个 key 达到 quota 后，真实请求会自然切到可用 key，不用后台探测浪费额度。 | `e7c742a0c` |
+| 后台 review 安全边界 | 后台 review 可以记录 memory、提出 skill 建议，但创建或修改 skill 必须经过批准，不会由非阻塞 review 线程静默写入。 | `1c4de266c` |
 
 ## 分支模型
 
@@ -54,11 +54,11 @@
 | `5fc9603ae` | 把语音转写作为可能有误的上下文处理。 |
 | `1c4de266c` | 后台 review 创建 skills 前必须经过批准。 |
 | `4cab4b729` | 附件发送失败会显式暴露。 |
-| `9bb825941` | 让本地测试与当前上游 runtime 语义对齐。 |
+| `9bb825941` | 让压缩和 Responses replay 与当前上游 runtime 语义对齐。 |
 | `e7c742a0c` | Tavily 多 key 池保持可用。 |
 | `6f98baee4` | goal 可跨 compression session split 保留。 |
-| `60a518780` | 真实 Codex Responses replay 下 compaction 更稳。 |
-| `e2e898f60` | 保留 checkpoint-framed v2 context compaction。 |
+| `60a518780` | 真实 Codex Responses replay 下长会话压缩更稳。 |
+| `e2e898f60` | 为长会话压缩加入结构化交接 checkpoint。 |
 
 ## 更新上游代码时
 
