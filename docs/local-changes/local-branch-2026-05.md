@@ -34,31 +34,31 @@ behavioral deltas below.
 
 Additional branch-only compatibility and maintenance commits:
 
-- `9bb825941` updates tests and minor compatibility around upstream's current
+- `39880e662` updates tests and minor compatibility around upstream's current
   runtime semantics: `ContextCompressor._generate_summary()` now receives
   `protected_head`, and xAI Responses replay keeps encrypted reasoning per
   upstream `agent.codex_responses_adapter` behavior.
-- `74a0085ab` keeps Codex response tests hermetic by mocking live metadata and
+- `e5c238dd9` keeps Codex response tests hermetic by mocking live metadata and
   pricing lookups that the latest release may otherwise perform during unit
   tests.
-- `4e5e46b8a` documents the upstream `v2026.5.29.2` forward-port boundary so
+- `b8d34d80` documents the upstream `v2026.5.29.2` forward-port boundary so
   future updates know which old local patches were replayed, superseded, or
   intentionally left behind.
-- `4cab4b729` makes required attachment delivery failures visible instead of
+- `27843b92d` makes required attachment delivery failures visible instead of
   treating text delivery as overall success when file uploads fail.
-- `1c4de266c` requires explicit approval before background review can create
+- `dcd0d249` requires explicit approval before background review can create
   skills, keeping non-blocking review threads from mutating the skills surface
   without operator consent.
-- `fe67c67b9` makes the repository identity explicit as a personal fork, adds
+- `5045483d` makes the repository identity explicit as a personal fork, adds
   branch strategy guidance, and preserves upstream release/tag intake through
   the `upstream` remote.
-- `484e9b681` links the top-level README to this maintained local-change index
+- `9ed60b33` links the top-level README to this maintained local-change index
   so the fork identity and local delta inventory are visible from the default
   project entry point.
-- `5fc9603ae` treats voice transcripts as fallible context, so model prompts
+- `d813a03d` treats voice transcripts as fallible context, so model prompts
   know transcribed voice may contain recognition errors and should use nearby
   context when inferring intent.
-- `abaa238fd` requires concrete evidence before the `/goal` judge marks a goal
+- `b0b6a411` requires concrete evidence before the `/goal` judge marks a goal
   complete and makes the judge timeout configurable for slower main-model
   verdicts.
 
@@ -87,12 +87,12 @@ adapters, tokens, webhooks, sessions, and outbound message delivery.
 | `eb9c7e9cc` | `/fast` mode / Anthropic priority | Yes | Recorded here |
 | `6351d442a` | Persistent `/goal` across compression splits | Yes | Recorded here |
 | `27815ffb8` | Tavily multi-key pool | Yes | Product docs updated + recorded here |
-| `4cab4b729` | Gateway attachment delivery failure reporting | Yes | Recorded here |
-| `1c4de266c` | Background-review skill proposal approval | Yes | Recorded here |
-| `fe67c67b9` | Fork identity and branch strategy | Developer-facing | README + branch strategy docs |
-| `484e9b681` | Local-change index discoverability | Developer-facing | README + recorded here |
-| `5fc9603ae` | Voice transcript prompt semantics | Yes | Recorded here |
-| `abaa238fd` | `/goal` judge completion evidence | Yes | Recorded here |
+| `27843b92d` | Gateway attachment delivery failure reporting | Yes | Recorded here |
+| `dcd0d249` | Background-review skill proposal approval | Yes | Recorded here |
+| `5045483d` | Fork identity and branch strategy | Developer-facing | README + branch strategy docs |
+| `9ed60b33` | Local-change index discoverability | Developer-facing | README + recorded here |
+| `d813a03d` | Voice transcript prompt semantics | Yes | Recorded here |
+| `b0b6a411` | `/goal` judge completion evidence | Yes | Recorded here |
 
 ## Context compression and Codex Responses recovery
 
@@ -313,7 +313,7 @@ Maintenance notes:
 
 ## Gateway attachment delivery visibility
 
-### `4cab4b729` — Make attachment delivery failures visible
+### `27843b92d` — Make attachment delivery failures visible
 
 Intent: prevent false-positive delivery success when text sends correctly but a requested file or archive attachment fails to upload.
 
@@ -343,7 +343,7 @@ Maintenance notes:
 
 ## Background review skill creation approval
 
-### `1c4de266c` — Require approval before background review creates skills
+### `dcd0d249` — Require approval before background review creates skills
 
 Intent: keep background review non-blocking while preventing it from creating or modifying skills without explicit operator approval.
 
@@ -377,7 +377,7 @@ Maintenance notes:
 
 ## Fork identity and release intake
 
-### `fe67c67b9` — Make fork identity explicit before branch normalization
+### `5045483d` — Make fork identity explicit before branch normalization
 
 Intent: make this checkout read as a personal, needs-driven fork rather than an upstream PR staging mirror.
 

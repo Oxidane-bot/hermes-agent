@@ -27,13 +27,14 @@ summarizes what is special about this fork.
 
 | Feature | User-facing value | Representative commits |
 |---|---|---|
-| Goal automation | `/goal` survives session compression and stops on evidence of completion instead of looping on bare “done” text. The judge timeout is configurable, so the stronger main model can be used reliably. | `6f98baee4`, `abaa238fd` |
-| Voice message handling | Voice notes are delivered to the model as marked transcripts, not exact user wording. The model is prompted to treat ASR text as fallible and use conversation context; voice replies can also answer pending clarification prompts. | `2ab1f2c91`, `5fc9603ae` |
-| Long-session compaction | Compression produces structured handoff checkpoints that preserve the active task, current work state, files, tests, and remaining work. The request shape also keeps the system-prefix/prompt-cache behavior consistent instead of drifting after compaction. | `e2e898f60`, `60a518780`, `9bb825941` |
-| Codex Responses replay | Auxiliary compaction follows the same Responses-style replay shape as the main agent, preserving tool calls, function outputs, reasoning items, and timeouts/fallbacks instead of flattening the conversation into lossy text. | `60a518780`, `9bb825941` |
-| Attachment delivery reliability | When the agent references local files or `MEDIA:` paths, the gateway attempts native upload for supported files, including archives. If an attachment cannot be parsed or delivered, the user gets an explicit warning and lifecycle hooks see the turn as failed. | `4cab4b729` |
-| Web search credentials | Tavily can use a pool of API keys with fill-first selection and cooldown, keeping web search available when one key hits quota without wasting quota on background probes. | `e7c742a0c` |
-| Background review safety | Background review can collect memory and propose skills, but skill creation or mutation requires approval instead of happening silently from a non-blocking review thread. | `1c4de266c` |
+| Goal automation | `/goal` survives session compression and stops on evidence of completion instead of looping on bare “done” text. The judge timeout is configurable, so the stronger main model can be used reliably. | `6f98baee4`, `b0b6a411` |
+| Voice message handling | Voice notes are delivered to the model as marked transcripts, not exact user wording. The model is prompted to treat ASR text as fallible and use conversation context; voice replies can also answer pending clarification prompts. | `2ab1f2c91`, `d813a03d` |
+| Provider fast modes | `/fast` keeps Anthropic `speed=fast` separate from ChatGPT/Codex priority processing, while older `service_tier=fast` configs still behave as expected. This prevents one provider's “fast” switch from accidentally changing another provider's routing semantics. | `a8b81172b` |
+| Long-session compaction | Compression produces structured handoff checkpoints that preserve the active task, current work state, files, tests, and remaining work. The request shape also keeps the system-prefix/prompt-cache behavior consistent instead of drifting after compaction. | `e2e898f60`, `60a518780`, `39880e662` |
+| Codex Responses replay | Auxiliary compaction follows the same Responses-style replay shape as the main agent, preserving tool calls, function outputs, reasoning items, and timeouts/fallbacks instead of flattening the conversation into lossy text. | `60a518780`, `39880e662` |
+| Attachment delivery reliability | When the agent references local files or `MEDIA:` paths, the gateway attempts native upload for supported files, including archives. If an attachment cannot be parsed or delivered, the user gets an explicit warning and lifecycle hooks see the turn as failed. | `27843b92d` |
+| Web search credentials | Tavily can use a pool of API keys with fill-first selection and cooldown, keeping web search available when one key hits quota without wasting quota on background probes. | `06abd9d49` |
+| Background review safety | Background review can collect memory and propose skills, but skill creation or mutation requires approval instead of happening silently from a non-blocking review thread. | `dcd0d249` |
 
 ## Branch model
 
@@ -61,13 +62,14 @@ for the exact policy.
 
 | Commit | Purpose |
 |---|---|
-| `e58803e6b` | Clarifies the fork branch contract and upstream intake policy. |
-| `abaa238fd` | Requires evidence before `/goal` judge completion and honors judge timeout config. |
-| `5fc9603ae` | Treats voice transcripts as fallible model context. |
-| `1c4de266c` | Requires approval before background review creates skills. |
-| `4cab4b729` | Makes attachment delivery failures visible. |
-| `9bb825941` | Keeps compaction and Responses replay compatible with the current upstream runtime. |
-| `e7c742a0c` | Keeps Tavily usable across pooled keys. |
+| `b776f462` | Clarifies the fork branch contract and upstream intake policy. |
+| `b0b6a411` | Requires evidence before `/goal` judge completion and honors judge timeout config. |
+| `d813a03d` | Treats voice transcripts as fallible model context. |
+| `a8b81172b` | Separates Anthropic Fast Mode from ChatGPT/Codex priority processing. |
+| `dcd0d249` | Requires approval before background review creates skills. |
+| `27843b92d` | Makes attachment delivery failures visible. |
+| `39880e662` | Keeps compaction and Responses replay compatible with the current upstream runtime. |
+| `06abd9d49` | Keeps Tavily usable across pooled keys. |
 | `6f98baee4` | Preserves goals across compression session splits. |
 | `60a518780` | Keeps compaction robust through real Codex Responses replay. |
 | `e2e898f60` | Adds structured handoff checkpoints for long-session compaction. |
