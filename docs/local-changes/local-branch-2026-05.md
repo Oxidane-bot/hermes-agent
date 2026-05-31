@@ -1,4 +1,4 @@
-# May 2026 Local Branch Changes
+# May 2026 Local Fork Changes
 
 Original baseline: `fork/local` at `eb76cdd740dc4dcf07542eb7c217b642d03b763b`.
 Current local head when this document was created: `27815ffb8`.
@@ -6,7 +6,7 @@ Current local head when this document was created: `27815ffb8`.
 Forward-port check baseline: upstream release `v2026.5.29.2` (`77a1650c7`),
 checked on branch `upgrade/v2026.5.29.2-check`.
 
-This file documents the local-only commits above the fork baseline so future maintenance can tell which behavior is intentional and which can be dropped when upstream catches up.
+This file documents the local-only commits above the fork baseline so future maintenance can tell which behavior is intentional and which can be dropped when upstream catches up. It is linked from the top-level README as the maintained inventory of fork-specific behavior.
 
 ## Forward-port status against `v2026.5.29.2`
 
@@ -32,7 +32,7 @@ behavioral deltas below.
 | `27815ffb8` | Ported with docs merge | Tavily multi-key/cooldown/crawl auth retained; web-search docs merged with upstream's newer Brave/DDGS/xAI provider rows. |
 | `20df23368` | Ported | This documentation directory retained. |
 
-Additional branch-only compatibility commits:
+Additional branch-only compatibility and maintenance commits:
 
 - `9bb825941` updates tests and minor compatibility around upstream's current
   runtime semantics: `ContextCompressor._generate_summary()` now receives
@@ -41,6 +41,17 @@ Additional branch-only compatibility commits:
 - `74a0085ab` keeps Codex response tests hermetic by mocking live metadata and
   pricing lookups that the latest release may otherwise perform during unit
   tests.
+- `4e5e46b8a` documents the upstream `v2026.5.29.2` forward-port boundary so
+  future updates know which old local patches were replayed, superseded, or
+  intentionally left behind.
+- `4cab4b729` makes required attachment delivery failures visible instead of
+  treating text delivery as overall success when file uploads fail.
+- `1c4de266c` requires explicit approval before background review can create
+  skills, keeping non-blocking review threads from mutating the skills surface
+  without operator consent.
+- `fe67c67b9` makes the repository identity explicit as a personal fork, adds
+  branch strategy guidance, and preserves upstream release/tag intake through
+  the `upstream` remote.
 
 Verification for the forward-port branch:
 
@@ -67,6 +78,9 @@ adapters, tokens, webhooks, sessions, and outbound message delivery.
 | `eb9c7e9cc` | `/fast` mode / Anthropic priority | Yes | Recorded here |
 | `6351d442a` | Persistent `/goal` across compression splits | Yes | Recorded here |
 | `27815ffb8` | Tavily multi-key pool | Yes | Product docs updated + recorded here |
+| `4cab4b729` | Gateway attachment delivery failure reporting | Yes | Recorded here |
+| `1c4de266c` | Background-review skill proposal approval | Yes | Recorded here |
+| `fe67c67b9` | Fork identity and branch strategy | Developer-facing | README + branch strategy docs |
 
 ## Context compression and Codex Responses recovery
 
@@ -284,3 +298,94 @@ Maintenance notes:
 
 - Do not change this to round-robin unless the goal changes from quota exhaustion to even load distribution.
 - Do not add proactive health checks; real requests are the recovery mechanism.
+
+## Gateway attachment delivery visibility
+
+### `4cab4b729` — Make attachment delivery failures visible
+
+Intent: prevent false-positive delivery success when text sends correctly but a requested file or archive attachment fails to upload.
+
+Touched areas:
+
+- `gateway/platforms/base.py`
+- `gateway/run.py`
+- Gateway attachment, topic-session, TTS media-routing, and send-message tests
+
+User-visible behavior:
+
+- Required file delivery failures are reported automatically in English.
+- Archive-style paths such as `.tar.xz` are included in MEDIA/local-file delivery routing instead of being silently skipped.
+- Streaming and non-streaming delivery paths share the same incomplete-delivery visibility contract.
+
+Verification recorded in commit:
+
+- `pytest tests/gateway/test_send_image_file.py::TestExtractMediaImages tests/gateway/test_base_topic_sessions.py::TestBasePlatformTopicSessions tests/gateway/test_tts_media_routing.py tests/gateway/test_stream_consumer.py tests/tools/test_send_message_tool.py tests/tools/test_signal_media.py -q`
+- `python -m py_compile gateway/platforms/base.py gateway/run.py`
+- `git diff --check`
+
+Maintenance notes:
+
+- Keep MEDIA parser extension support aligned with local-file delivery extensions.
+- Preserve explicit failure notices for required attachments; text delivery alone must not imply total success.
+- Live gateway/platform upload smoke with real Telegram API was not run at commit time.
+
+## Background review skill creation approval
+
+### `1c4de266c` — Require approval before background review creates skills
+
+Intent: keep background review non-blocking while preventing it from creating or modifying skills without explicit operator approval.
+
+Touched areas:
+
+- `agent/background_review.py`
+- `tools/memory_tool.py`
+- `tools/skill_manager_tool.py`
+- `gateway/run.py`
+- `gateway/platforms/telegram.py`
+- `hermes_cli/commands.py`
+- Memory, skill-manager, background-review, review-prompt, gateway proposal, and Telegram command tests
+
+User-visible behavior:
+
+- Background review may still propose useful memory or skill improvements.
+- Skill creation now routes through an approval/proposal flow instead of being silently applied by the review fork.
+- Telegram surfaces proposal approval affordances for the operator.
+
+Verification recorded in commit:
+
+- `scripts/run_tests.sh tests/tools/test_memory_tool.py tests/tools/test_skill_manager_tool.py tests/run_agent/test_review_prompt_class_first.py tests/run_agent/test_background_review_toolset_restriction.py tests/gateway/test_skill_proposal_command.py`
+- `python3 -m py_compile agent/background_review.py tools/memory_tool.py tools/skill_manager_tool.py gateway/run.py gateway/platforms/telegram.py hermes_cli/commands.py`
+- `git diff --check`
+
+Maintenance notes:
+
+- Background review must not call `clarify` or otherwise wait for user input.
+- Keep the review fork memory/skills-only at runtime.
+- Preserve the approval boundary for skill creation even if upstream changes the background-review prompt or toolset plumbing.
+
+## Fork identity and release intake
+
+### `fe67c67b9` — Make fork identity explicit before branch normalization
+
+Intent: make this checkout read as a personal, needs-driven fork rather than an upstream PR staging mirror.
+
+Touched areas:
+
+- `README.md`
+- `docs/local-changes/README.md`
+- `docs/local-changes/branch-strategy.md`
+
+Developer-facing behavior:
+
+- The README states that the fork maintains local operational changes while following useful official upstream releases.
+- Branch strategy docs define `origin` as the personal fork and `upstream` as the release/tag intake remote.
+- Historical topic branches should stay out of the normal branch list unless actively maintained.
+
+Verification recorded in commit:
+
+- Documentation-only change reviewed with `git diff`.
+
+Maintenance notes:
+
+- Keep README wording aligned with the branch strategy: personal fork first, upstream release tracking preserved.
+- Do not remove the `upstream` remote or tag-fetch path when cleaning branch clutter.

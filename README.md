@@ -4,7 +4,7 @@
 
 # Hermes Agent ☤
 
-> **Fork status:** This checkout is maintained as a personal, needs-driven fork of upstream [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent). The fork keeps its own operational changes on a local primary line and follows official upstream releases when they are useful or required. It is not intended to present the branch list as a PR staging queue for upstream.
+> **Fork status:** This checkout is maintained as a personal, needs-driven fork of upstream [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent). The fork keeps its own operational changes on a local primary line and follows official upstream releases when they are useful or required. It is not intended to present the branch list as a PR staging queue for upstream. See the maintained [local fork changes](docs/local-changes/README.md) index for the fork-specific deltas and branch strategy.
 
 
 <p align="center">
