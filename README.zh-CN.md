@@ -11,7 +11,7 @@
 
 ## 这个 fork 用来做什么
 
-- 运行并维护本地 `default` 和 `kurisu` 两个 Hermes profile。
+- 运行并维护本地 Hermes 部署 profile。
 - 先部署实际需要的运维修复，不等待上游合并或重新发现同类问题。
 - 让 fork-only 行为在以后更新上游代码前可以快速审计。
 - 保持 fork 分支列表很小，不再保留旧的上游 PR/topic 分支堆积。

@@ -16,7 +16,7 @@ summarizes what is special about this fork.
 
 ## What this fork is for
 
-- Run and maintain the local `default` and `kurisu` Hermes profiles.
+- Run and maintain the local Hermes deployment profiles.
 - Keep operational fixes deployed without waiting for upstream to accept or
   rediscover them.
 - Make fork-only behavior easy to audit before future upstream updates.
