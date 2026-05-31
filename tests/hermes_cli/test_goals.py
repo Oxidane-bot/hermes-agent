@@ -175,6 +175,60 @@ class TestJudgeGoal:
         assert verdict == "continue"
         assert reason == "not yet"
 
+    def test_judge_timeout_comes_from_goal_judge_config(self, hermes_home):
+        from hermes_cli import goals
+
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n"
+            "  goal_judge:\n"
+            "    timeout: 123\n",
+            encoding="utf-8",
+        )
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": true, "reason": "achieved"}')
+                )
+            ]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal("goal", "agent response")
+
+        assert verdict == "done"
+        assert reason == "achieved"
+        assert fake_client.chat.completions.create.call_args.kwargs["timeout"] == 123
+
+    def test_judge_timeout_argument_overrides_config(self, hermes_home):
+        from hermes_cli import goals
+
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n"
+            "  goal_judge:\n"
+            "    timeout: 123\n",
+            encoding="utf-8",
+        )
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": true, "reason": "achieved"}')
+                )
+            ]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            goals.judge_goal("goal", "agent response", timeout=7)
+
+        assert fake_client.chat.completions.create.call_args.kwargs["timeout"] == 7
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
@@ -759,6 +813,13 @@ class TestJudgeGoalWithSubgoals:
         user_msg = next((m["content"] for m in sent_messages if m["role"] == "user"), "")
         assert "Additional criteria" not in user_msg
         assert "ship it" in user_msg
+
+    def test_judge_system_prompt_rejects_bare_completion_claims(self):
+        from hermes_cli.goals import JUDGE_SYSTEM_PROMPT
+
+        assert "Do NOT mark DONE" in JUDGE_SYSTEM_PROMPT
+        assert "generic completion phrases" in JUDGE_SYSTEM_PROMPT
+        assert "concrete evidence" in JUDGE_SYSTEM_PROMPT
 
 
 class TestStatusLineSubgoalCount:

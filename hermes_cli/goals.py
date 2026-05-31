@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
-DEFAULT_JUDGE_TIMEOUT = 30.0
+DEFAULT_JUDGE_TIMEOUT = 120.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
 # before emitting the visible JSON — and the first /goal turn's prompt is
@@ -98,10 +98,17 @@ JUDGE_SYSTEM_PROMPT = (
     "agent's most recent response. Your only job is to decide whether "
     "the goal is fully satisfied based on that response.\n\n"
     "A goal is DONE only when:\n"
-    "- The response explicitly confirms the goal was completed, OR\n"
+    "- The response explicitly confirms the goal was completed AND gives "
+    "concrete evidence such as completed scope counts, accepted status, "
+    "file paths, command/test output, or other verifiable closure details, OR\n"
     "- The response clearly shows the final deliverable was produced, OR\n"
     "- The response explains the goal is unachievable / blocked / needs "
-    "user input (treat this as DONE with reason describing the block).\n\n"
+    "user input with a specific blocker (treat this as DONE with reason "
+    "describing the block).\n\n"
+    "Do NOT mark DONE based only on generic completion phrases like "
+    "'done', 'completed', 'finished', 'stopping', or 'goal achieved'. "
+    "If the response lacks concrete evidence that the stated goal is fully "
+    "satisfied, the goal is NOT done — CONTINUE.\n\n"
     "Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Reply ONLY with a single JSON object on one line:\n"
     '{\"done\": <true|false>, \"reason\": \"<one-sentence rationale>\"}'
@@ -358,6 +365,30 @@ def _goal_judge_max_tokens() -> int:
     return DEFAULT_JUDGE_MAX_TOKENS
 
 
+def _goal_judge_timeout() -> float:
+    """Resolve auxiliary.goal_judge.timeout, falling back to the default.
+
+    Goal judging can run on the same high-quality Responses backend as the main
+    agent.  A 30s hardcoded timeout is too tight for those routes, especially
+    when the provider does hidden reasoning or the gateway is under load.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            (cfg.get("auxiliary") or {})
+            .get("goal_judge", {})
+            .get("timeout", DEFAULT_JUDGE_TIMEOUT)
+        )
+        value = float(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_JUDGE_TIMEOUT
+
+
 def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
     """Parse the judge's reply. Fail-open to ``(False, "<reason>", parse_failed)``.
 
@@ -411,7 +442,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
-    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    timeout: Optional[float] = None,
     subgoals: Optional[List[str]] = None,
 ) -> Tuple[str, str, bool]:
     """Ask the auxiliary model whether the goal is satisfied.
@@ -476,6 +507,7 @@ def judge_goal(
         )
 
     try:
+        request_timeout = float(timeout) if timeout is not None else _goal_judge_timeout()
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -484,7 +516,7 @@ def judge_goal(
             ],
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
+            timeout=request_timeout,
             extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
