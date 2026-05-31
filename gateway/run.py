@@ -67,6 +67,26 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_VOICE_TRANSCRIPT_PREFIX = (
+    "[The user sent a voice message. This is an automatic speech-to-text "
+    "transcript and may contain recognition errors such as homophones, wrong "
+    "words, missing punctuation, or omitted words. Use the conversation "
+    "context to infer the user's intended meaning and correct obvious "
+    "transcription mistakes. If the intent is ambiguous or high-risk, ask a "
+    "brief clarification. Transcript: \""
+)
+_VOICE_TRANSCRIPT_SUFFIX = "\"]"
+
+
+def _format_voice_transcript_note(transcript: str) -> str:
+    return f"{_VOICE_TRANSCRIPT_PREFIX}{transcript}{_VOICE_TRANSCRIPT_SUFFIX}"
+
+
+def _extract_voice_transcript_note(note: str) -> Optional[str]:
+    if note.startswith(_VOICE_TRANSCRIPT_PREFIX) and note.endswith(_VOICE_TRANSCRIPT_SUFFIX):
+        return note[len(_VOICE_TRANSCRIPT_PREFIX):-len(_VOICE_TRANSCRIPT_SUFFIX)]
+    return None
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -8090,12 +8110,11 @@ class GatewayRunner:
 
         if audio_paths:
             try:
-                _voice_prefix = "[The user sent a voice message~ Here's what they said: \""
-                _voice_suffix = '\"]'
                 _voice_parts = []
                 for _part in message_text.split("\n\n"):
-                    if _part.startswith(_voice_prefix) and _part.endswith(_voice_suffix):
-                        _voice_parts.append(_part[len(_voice_prefix):-len(_voice_suffix)])
+                    _voice_transcript = _extract_voice_transcript_note(_part)
+                    if _voice_transcript is not None:
+                        _voice_parts.append(_voice_transcript)
                 if _voice_parts:
                     from tools import clarify_gateway as _clarify_mod
                     _pending_clarify = _clarify_mod.get_pending_for_session(session_key)
@@ -14958,10 +14977,7 @@ class GatewayRunner:
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
-                    enriched_parts.append(
-                        f'[The user sent a voice message~ '
-                        f'Here\'s what they said: "{transcript}"]'
-                    )
+                    enriched_parts.append(_format_voice_transcript_note(transcript))
                 else:
                     error = result.get("error", "unknown error")
                     if (

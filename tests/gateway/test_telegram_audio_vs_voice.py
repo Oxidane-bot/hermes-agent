@@ -77,6 +77,17 @@ async def test_voice_message_still_transcribed():
     mock_transcribe.assert_called_once_with("/tmp/voice.ogg")
     assert "hello world" in result
     assert "voice message" in result.lower()
+    assert "automatic speech-to-text transcript" in result
+    assert "recognition errors" in result
+    assert "Use the conversation context" in result
+
+
+def test_voice_transcript_note_round_trips_for_clarify_intercept():
+    from gateway.run import _extract_voice_transcript_note, _format_voice_transcript_note
+
+    note = _format_voice_transcript_note("homophone errors may happen")
+
+    assert _extract_voice_transcript_note(note) == "homophone errors may happen"
 
 
 # ---------------------------------------------------------------------------
