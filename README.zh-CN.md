@@ -31,8 +31,8 @@
 ## 分支模型
 
 - `origin/main` — 当前维护线，也是部署来源。
-- `origin/upstream-main` — 上游 `main` 的镜像，只用于对比和 future forward-port review。
-- 额外本地维护分支只有在有明确用途并记录到文档时才保留；当前 checkpoint worktree 是 `impl/v2-compaction-checkpoint`。
+- `upstream/main` — 只在需要对比或 forward-port 上游变化时从 `NousResearch/hermes-agent` 拉取，不再镜像到 `origin`。
+- 额外本地维护分支默认留在本地；只有在它有明确用途、且内容没有被 `main` 表达时，才需要记录并保留。
 - backup 分支、临时 PR 分支、旧的上游 topic 分支都不是稳定 fork 状态的一部分。
 
 准确策略见 [`docs/local-changes/branch-strategy.md`](docs/local-changes/branch-strategy.md)。
@@ -49,7 +49,7 @@
 
 | Commit | 用途 |
 |---|---|
-| `e58803e6b` | 明确 fork 分支契约和上游对比分支。 |
+| `e58803e6b` | 明确 fork 分支契约和上游接入策略。 |
 | `abaa238fd` | `/goal` judge 需要完成证据，并读取 timeout 配置。 |
 | `5fc9603ae` | 把语音转写作为可能有误的上下文处理。 |
 | `1c4de266c` | 后台 review 创建 skills 前必须经过批准。 |
@@ -66,7 +66,6 @@
 
 ```bash
 git fetch upstream --tags
-git push --force-with-lease origin upstream/main:refs/heads/upstream-main
 ```
 
-对比 `origin/main` 和上游镜像，只 forward-port 值得保留的变化；本地验证后，把新的 fork-only 行为记录到 `docs/local-changes/`。
+对比 `origin/main` 和 `upstream/main`，只 forward-port 值得保留的变化；本地验证后，把新的 fork-only 行为记录到 `docs/local-changes/`。

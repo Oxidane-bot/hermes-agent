@@ -38,11 +38,10 @@ summarizes what is special about this fork.
 ## Branch model
 
 - `origin/main` — active maintained fork line and deployment source.
-- `origin/upstream-main` — mirror of upstream `main`, used only for comparison
-  and forward-port review.
-- Additional local-maintained branches should exist only while they have an
-  active documented purpose. The current checkpoint worktree is
-  `impl/v2-compaction-checkpoint`.
+- `upstream/main` — fetched from `NousResearch/hermes-agent` only when comparing
+  or forward-porting upstream changes; it is not mirrored into `origin`.
+- Additional local-maintained branches should stay local unless they have an
+  active documented purpose that is not already represented on `main`.
 - Backup branches, temporary PR branches, and old upstream topic branches are
   not intended steady-state fork branches.
 
@@ -62,7 +61,7 @@ for the exact policy.
 
 | Commit | Purpose |
 |---|---|
-| `e58803e6b` | Clarifies the fork branch contract and upstream comparison branch. |
+| `e58803e6b` | Clarifies the fork branch contract and upstream intake policy. |
 | `abaa238fd` | Requires evidence before `/goal` judge completion and honors judge timeout config. |
 | `5fc9603ae` | Treats voice transcripts as fallible model context. |
 | `1c4de266c` | Requires approval before background review creates skills. |
@@ -79,9 +78,8 @@ Use upstream as an input, not as the public branch surface of this fork:
 
 ```bash
 git fetch upstream --tags
-git push --force-with-lease origin upstream/main:refs/heads/upstream-main
 ```
 
-Review the upstream diff against `origin/main`, forward-port only the changes
-that are worth carrying, verify locally, and document any new fork-only behavior
-under `docs/local-changes/`.
+Review `upstream/main` against `origin/main`, forward-port only the changes that
+are worth carrying, verify locally, and document any new fork-only behavior under
+`docs/local-changes/`.
