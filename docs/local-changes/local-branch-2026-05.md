@@ -52,6 +52,15 @@ Additional branch-only compatibility and maintenance commits:
 - `fe67c67b9` makes the repository identity explicit as a personal fork, adds
   branch strategy guidance, and preserves upstream release/tag intake through
   the `upstream` remote.
+- `484e9b681` links the top-level README to this maintained local-change index
+  so the fork identity and local delta inventory are visible from the default
+  project entry point.
+- `5fc9603ae` treats voice transcripts as fallible context, so model prompts
+  know transcribed voice may contain recognition errors and should use nearby
+  context when inferring intent.
+- `abaa238fd` requires concrete evidence before the `/goal` judge marks a goal
+  complete and makes the judge timeout configurable for slower main-model
+  verdicts.
 
 Verification for the forward-port branch:
 
@@ -81,6 +90,9 @@ adapters, tokens, webhooks, sessions, and outbound message delivery.
 | `4cab4b729` | Gateway attachment delivery failure reporting | Yes | Recorded here |
 | `1c4de266c` | Background-review skill proposal approval | Yes | Recorded here |
 | `fe67c67b9` | Fork identity and branch strategy | Developer-facing | README + branch strategy docs |
+| `484e9b681` | Local-change index discoverability | Developer-facing | README + recorded here |
+| `5fc9603ae` | Voice transcript prompt semantics | Yes | Recorded here |
+| `abaa238fd` | `/goal` judge completion evidence | Yes | Recorded here |
 
 ## Context compression and Codex Responses recovery
 
