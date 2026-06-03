@@ -477,6 +477,22 @@ def _resolve_gateway_display_bool(
     return bool(value)
 
 
+def _should_send_fresh_heartbeat(edit_result: Any) -> bool:
+    """Return True when a heartbeat edit failure should fall back to send().
+
+    Retryable transport failures (e.g. Telegram/httpx disconnects) should NOT
+    create a fresh "⏳ Working — …" bubble each interval. Keep the old heartbeat
+    in place and retry editing it on the next tick instead.
+    """
+    if not edit_result:
+        return True
+    if getattr(edit_result, "success", False):
+        return False
+    if getattr(edit_result, "retryable", False):
+        return False
+    return True
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -16290,7 +16306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
+                    if _should_send_fresh_heartbeat(_notify_res):
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
