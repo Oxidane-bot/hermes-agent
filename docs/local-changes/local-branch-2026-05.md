@@ -118,7 +118,7 @@ Maintenance notes:
 
 - Keep auxiliary Codex compact conversion aligned with `agent.codex_responses_adapter`.
 - Preserve system prompt prefix behavior because prompt-cache parity depends on it.
-- Live PRIMARY_PROVIDER compaction was not tested at commit time.
+- Live pinned-provider compaction was not tested at commit time.
 
 ### `f1431f9db` — Recover auxiliary compact from null Responses output
 
@@ -129,7 +129,7 @@ Touched areas:
 - `agent/auxiliary_client.py`
 - `tests/agent/test_auxiliary_client.py`
 
-Behavioral note: internal reliability fix. It prevents local compaction aborts when PRIMARY_PROVIDER is otherwise healthy.
+Behavioral note: internal reliability fix. It prevents local compaction aborts when a pinned provider is otherwise healthy.
 
 Verification recorded in commit:
 
@@ -140,7 +140,7 @@ Verification recorded in commit:
 Maintenance notes:
 
 - Prefer streamed evidence over a malformed final snapshot.
-- Live PRIMARY_PROVIDER compaction after restart was not tested at commit time.
+- Live pinned-provider compaction after restart was not tested at commit time.
 
 ### `9b6f33272` — Recover Codex streams from null completed output
 
@@ -162,7 +162,7 @@ Verification recorded in commit:
 Maintenance notes:
 
 - Do not treat malformed final snapshots as provider outages when streamed content is recoverable.
-- Live PRIMARY_PROVIDER request after restart was not tested at commit time.
+- Live pinned-provider request after restart was not tested at commit time.
 
 ### `c8f0de31b` — Recover streamed Codex output before final snapshots
 

@@ -71,6 +71,48 @@ def codex_auth_dir(tmp_path, monkeypatch):
     return codex_dir
 
 
+class TestCodexCompletionsAdapterRequestBody:
+    def test_forwards_cache_key_and_reasoning_to_responses_body(self):
+        captured = {}
+
+        class EventStream:
+            def close(self):
+                pass
+
+        real_client = SimpleNamespace(
+            responses=SimpleNamespace(
+                create=lambda **kwargs: captured.setdefault("kwargs", kwargs) or EventStream()
+            )
+        )
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        final = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text="ok")],
+                )
+            ],
+            usage=None,
+        )
+
+        with patch("agent.codex_runtime._consume_codex_event_stream", return_value=final):
+            response = adapter.create(
+                messages=[{"role": "user", "content": "summarize"}],
+                extra_body={
+                    "prompt_cache_key": "session-123",
+                    "reasoning": {"effort": "high"},
+                },
+            )
+
+        kwargs = captured["kwargs"]
+        assert kwargs["prompt_cache_key"] == "session-123"
+        assert kwargs["extra_headers"]["session_id"] == "session-123"
+        assert kwargs["extra_headers"]["x-client-request-id"] == "session-123"
+        assert kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
+        assert response.choices[0].message.content == "ok"
+
+
 class TestAuxiliaryMaxTokensParam:
     def test_uses_max_completion_tokens_for_github_copilot_custom_base(self):
         with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com", "key", None)), \

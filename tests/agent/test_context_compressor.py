@@ -288,6 +288,31 @@ class TestNonStringContent:
             "api_mode": "codex_responses",
         }
 
+    def test_summary_call_inherits_cache_key_and_reasoning_for_codex_responses(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="codex-token",
+                api_mode="codex_responses",
+                quiet_mode=True,
+            )
+        c.summary_prompt_cache_key = "session-123"
+        c.summary_reasoning_config = {"enabled": True, "effort": "high"}
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary([{"role": "user", "content": "hello"}])
+
+        assert mock_call.call_args.kwargs["extra_body"] == {
+            "prompt_cache_key": "session-123",
+            "reasoning": {"effort": "high"},
+        }
+
     def test_summary_request_preserves_layout_and_appends_checkpoint(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -721,7 +746,7 @@ class TestStreamingClosedFallback:
         assert "summary via summary model" in result
 
     def test_stream_read_error_retries_summary_model(self):
-        """PRIMARY_PROVIDER-style stream_read_error is transient and should retry before cooldown."""
+        """stream_read_error is transient and should retry before cooldown."""
         mock_ok = MagicMock()
         mock_ok.choices = [MagicMock()]
         mock_ok.choices[0].message.content = "summary after stream retry"

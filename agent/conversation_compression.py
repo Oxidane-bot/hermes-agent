@@ -312,6 +312,18 @@ def compress_context(
         except Exception:
             pass
 
+    # Let the built-in compressor mirror the active main-request cache and
+    # reasoning knobs for the summary request.  The values are assigned just
+    # before compression because gateway sessions can change reasoning effort
+    # per turn and compression rotates ``agent.session_id`` after the summary.
+    if hasattr(agent.context_compressor, "summary_prompt_cache_key"):
+        agent.context_compressor.summary_prompt_cache_key = agent.session_id or ""
+    if hasattr(agent.context_compressor, "summary_reasoning_config"):
+        _reasoning_cfg = getattr(agent, "reasoning_config", None)
+        agent.context_compressor.summary_reasoning_config = (
+            dict(_reasoning_cfg) if isinstance(_reasoning_cfg, dict) else None
+        )
+
     try:
         compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
     except TypeError:

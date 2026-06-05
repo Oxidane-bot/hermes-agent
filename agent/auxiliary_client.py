@@ -639,6 +639,28 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            prompt_cache_key = str(extra_body.get("prompt_cache_key") or "").strip()
+            if prompt_cache_key:
+                if self._is_xai_responses:
+                    merged_extra_body = dict(resp_kwargs.get("extra_body") or {})
+                    merged_extra_body.setdefault("prompt_cache_key", prompt_cache_key)
+                    resp_kwargs["extra_body"] = merged_extra_body
+                else:
+                    resp_kwargs["prompt_cache_key"] = prompt_cache_key
+                    existing_extra_headers = kwargs.get("extra_headers")
+                    merged_extra_headers: Dict[str, str] = {}
+                    if isinstance(existing_extra_headers, dict):
+                        merged_extra_headers.update(
+                            {
+                                str(key): str(value)
+                                for key, value in existing_extra_headers.items()
+                                if key and value is not None
+                            }
+                        )
+                    merged_extra_headers["session_id"] = prompt_cache_key
+                    merged_extra_headers["x-client-request-id"] = prompt_cache_key
+                    resp_kwargs["extra_headers"] = merged_extra_headers
+
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:

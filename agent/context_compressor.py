@@ -610,6 +610,11 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+        # Set by the owning agent immediately before compression so the
+        # auxiliary summary request can use the same cache/reasoning knobs as
+        # the active main request without baking AIAgent into this class.
+        self.summary_prompt_cache_key: Optional[str] = None
+        self.summary_reasoning_config: Optional[Dict[str, Any]] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -1132,6 +1137,21 @@ Write only the summary body. Start at "## Active Task"; do not include any pream
         summary_messages.append({"role": "user", "content": checkpoint_instruction})
 
         try:
+            summary_extra_body: Dict[str, Any] = {}
+            if self.api_mode == "codex_responses":
+                prompt_cache_key = str(getattr(self, "summary_prompt_cache_key", "") or "").strip()
+                if prompt_cache_key:
+                    summary_extra_body["prompt_cache_key"] = prompt_cache_key
+
+                reasoning_cfg = getattr(self, "summary_reasoning_config", None)
+                if isinstance(reasoning_cfg, dict):
+                    if reasoning_cfg.get("enabled") is False:
+                        summary_extra_body["reasoning"] = {"enabled": False}
+                    else:
+                        effort = str(reasoning_cfg.get("effort") or "").strip().lower()
+                        if effort:
+                            summary_extra_body["reasoning"] = {"effort": effort}
+
             call_kwargs = {
                 "task": "compression",
                 "main_runtime": {
@@ -1145,15 +1165,17 @@ Write only the summary body. Start at "## Active Task"; do not include any pream
                 "max_tokens": int(summary_budget * 1.3),
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
+            if summary_extra_body:
+                call_kwargs["extra_body"] = summary_extra_body
             # Transient-retry loop.  `call_llm` itself has no retry for
             # `provider != "auto"` — when the user pins an explicit provider
-            # (e.g. `custom:primary-provider`), a single connection blip during a high
-            # peak makes the whole compaction lose the middle turns.  Retry
-            # connection/timeout/stream-closed errors a few times with a
-            # short backoff before trying configured fallback compression
-            # models, then letting the outer ``except`` enter cooldown.  See
-            # incident 2026-05-26 17:21 where one transient 502 from
-            # llm.example.club lost ~527 messages of context.
+            # (for example, a named custom provider), a single connection
+            # blip during peak traffic can make the whole compaction lose the
+            # middle turns.  Retry connection/timeout/stream-closed errors a
+            # few times with a short backoff before trying configured fallback
+            # compression models, then letting the outer ``except`` enter
+            # cooldown.  This guards against transient upstream 5xx responses
+            # on large compaction requests.
             _max_transient_attempts = 3
             _backoff_seconds = (3.0, 8.0)  # between attempt 1->2 and 2->3
             _model_candidates: List[Optional[str]] = []

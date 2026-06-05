@@ -103,6 +103,28 @@ class TestVerboseAndToolProgress:
 
 
 class TestFallbackChainInit:
+    def test_model_fallbacks_precede_provider_fallbacks(self):
+        cli = _make_cli(config_overrides={
+            "model": {
+                "provider": "custom:primary-provider",
+                "base_url": "https://llm.example.test/v1",
+                "api_mode": "codex_responses",
+                "fallback_models": ["primary-fallback-model"],
+            },
+            "fallback_providers": [
+                {"provider": "backup-provider", "model": "backup-model"},
+            ],
+        })
+        assert cli._fallback_model == [
+            {
+                "provider": "custom:primary-provider",
+                "model": "primary-fallback-model",
+                "base_url": "https://llm.example.test/v1",
+                "api_mode": "codex_responses",
+            },
+            {"provider": "backup-provider", "model": "backup-model"},
+        ]
+
     def test_merges_new_and_legacy_fallback_config(self):
         cli = _make_cli(config_overrides={
             "fallback_providers": [

@@ -117,6 +117,21 @@ class TestFallbackChainAdvancement:
             assert agent.model == "glm-4.7"
             assert agent._fallback_index == 2
 
+    def test_fallback_entry_api_mode_is_honored(self):
+        fbs = [{
+            "provider": "custom:primary-provider",
+            "model": "primary-fallback-model",
+            "base_url": "https://llm.example.test/v1",
+            "api_mode": "codex_responses",
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(base_url="https://llm.example.test/v1"), "primary-fallback-model")):
+            assert agent._try_activate_fallback() is True
+            assert agent.provider == "custom:primary-provider"
+            assert agent.model == "primary-fallback-model"
+            assert agent.api_mode == "codex_responses"
+
     def test_all_exhausted_returns_false(self):
         fbs = [{"provider": "openai", "model": "gpt-4o"}]
         agent = _make_agent(fallback_model=fbs)
