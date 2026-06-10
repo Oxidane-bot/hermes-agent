@@ -53,7 +53,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 # Now we can safely import
-from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+from gateway.platforms.telegram import TELEGRAM_MAX_DOCUMENT_UPLOAD_BYTES, TelegramAdapter  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +703,34 @@ class TestSendDocument:
 
         call_kwargs = connected_adapter._bot.send_document.call_args[1]
         assert len(call_kwargs["caption"]) == 1024
+
+    @pytest.mark.asyncio
+    async def test_send_document_too_large_returns_failure_without_path_fallback(
+        self,
+        connected_adapter,
+        tmp_path,
+    ):
+        """Oversized Telegram uploads fail loudly instead of texting a local path."""
+        test_file = tmp_path / "large.zip"
+        with open(test_file, "wb") as f:
+            f.truncate(TELEGRAM_MAX_DOCUMENT_UPLOAD_BYTES + 1)
+
+        connected_adapter._bot.send_document = AsyncMock()
+        connected_adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert "too large" in result.error.lower()
+        assert str(test_file) in result.error
+        connected_adapter._bot.send_document.assert_not_called()
+        connected_adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_document_api_error_falls_back(self, connected_adapter, tmp_path):
