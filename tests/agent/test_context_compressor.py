@@ -721,7 +721,7 @@ class TestStreamingClosedFallback:
         assert "summary via summary model" in result
 
     def test_stream_read_error_retries_summary_model(self):
-        """PRIMARY_PROVIDER-style stream_read_error is transient and should retry before cooldown."""
+        """stream_read_error is transient and should retry before cooldown."""
         mock_ok = MagicMock()
         mock_ok.choices = [MagicMock()]
         mock_ok.choices[0].message.content = "summary after stream retry"
