@@ -166,9 +166,16 @@ fallback_model:
 |---------|-------------------|
 | CLI sessions | ✔ |
 | Messaging gateway (Telegram, Discord, etc.) | ✔ |
-| Subagent delegation | ✘ (subagents do not inherit fallback config) |
-| Cron jobs | ✘ (run with a fixed provider) |
+| Subagent delegation | ✔ (child agents inherit the parent fallback chain) |
+| Cron jobs | ✔ (scheduled agents use the same configured fallback chain) |
 | Auxiliary tasks (vision, compression) | ✘ (use their own provider chain — see below) |
+
+Cron jobs resolve the same top-level `fallback_providers` / `fallback_model`
+chain as interactive sessions. If the primary provider cannot authenticate
+before a scheduled agent starts, cron resolves the first usable fallback
+provider and runs that job with the fallback entry's model. If the provider
+fails after the agent is already running, the normal in-turn fallback path
+continues to apply.
 
 :::tip
 There are no environment variables for `fallback_model` — it is configured exclusively through `config.yaml`. This is intentional: fallback configuration is a deliberate choice, not something a stale shell export should override.

@@ -21,6 +21,13 @@ Cron 任务可以：
 
 所有这些功能均可通过 `cronjob` 工具由 Hermes 自身使用，因此你可以用自然语言创建、暂停、编辑和删除任务——无需 CLI。
 
+:::tip
+Cron 任务使用 `hermes model` 选择的提供商，并遵循与交互式会话相同的顶层
+`fallback_providers` / `fallback_model` 链。`hermes setup --portal` 是无人值守
+运行的低摩擦选项，因为 OAuth 刷新是自动完成的。另请参阅
+[备用提供商](./fallback-providers.md)。
+:::
+
 :::warning
 Cron 运行的会话不能递归创建更多 cron 任务。Hermes 在 cron 执行内部禁用了 cron 管理工具，以防止失控的调度循环。
 :::
