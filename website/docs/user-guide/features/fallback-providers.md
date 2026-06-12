@@ -170,6 +170,13 @@ fallback_providers:
 | Cron jobs | ✔ (cron agents inherit configured fallback providers) |
 | Auxiliary tasks on `provider: auto` | ✔ (try per-task fallback, then the main fallback chain before built-in aux discovery) |
 
+Cron jobs resolve the same top-level `fallback_providers` / `fallback_model`
+chain as interactive sessions. If the primary provider cannot authenticate
+before a scheduled agent starts, cron resolves the first usable fallback
+provider and runs that job with the fallback entry's model. If the provider
+fails after the agent is already running, the normal in-turn fallback path
+continues to apply.
+
 :::tip
 There are no environment variables for the primary fallback chain — configure it exclusively through `config.yaml` or `hermes fallback`. This is intentional: fallback configuration is a deliberate choice, not something a stale shell export should override.
 :::

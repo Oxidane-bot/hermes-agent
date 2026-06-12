@@ -22,7 +22,11 @@ Cron jobs can:
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
 
 :::tip
-Cron jobs use whatever provider `hermes model` selected. `hermes setup --portal` is the lowest-friction option for unattended runs since OAuth refresh is automatic. See [Nous Portal](/integrations/nous-portal).
+Cron jobs use whatever provider `hermes model` selected and honor the same
+top-level `fallback_providers` / `fallback_model` chain as interactive
+sessions. `hermes setup --portal` is the lowest-friction option for unattended
+runs since OAuth refresh is automatic. See [Nous Portal](/integrations/nous-portal)
+and [Fallback Providers](./fallback-providers.md).
 :::
 
 :::warning
