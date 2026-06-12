@@ -1580,6 +1580,56 @@ class TestRunJobConfigEnvVarExpansion:
             "config.yaml ${VAR} in fallback_providers was not expanded."
         )
 
+    def test_auth_error_switches_cron_model_to_resolved_fallback(self, tmp_path, monkeypatch):
+        """Cron auth fallback must use the fallback entry's model, like normal sessions."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: primary-model\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: anthropic/claude-sonnet-4.6\n"
+            "    api_key_env: _HERMES_TEST_CRON_FALLBACK_KEY\n"
+        )
+        monkeypatch.setenv("_HERMES_TEST_CRON_FALLBACK_KEY", "fallback-key")
+
+        job = {"id": "auth-fb-job", "name": "auth fallback test", "prompt": "hi"}
+        fake_db = MagicMock()
+        calls = []
+
+        def _resolve_runtime_provider(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise AuthError("primary token expired", provider="openai-codex")
+            return {
+                "api_key": kwargs.get("explicit_api_key"),
+                "base_url": "https://openrouter.ai/api/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=_resolve_runtime_provider), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert calls[1]["requested"] == "openrouter"
+        assert calls[1]["explicit_api_key"] == "fallback-key"
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "openrouter"
+        assert kwargs["model"] == "anthropic/claude-sonnet-4.6"
+
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
