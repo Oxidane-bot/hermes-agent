@@ -816,20 +816,60 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
     ".md": "text/markdown",
     ".txt": "text/plain",
+    ".text": "text/plain",
     ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
     ".log": "text/plain",
     ".json": "application/json",
+    ".jsonl": "application/x-ndjson",
     ".xml": "application/xml",
     ".yaml": "application/yaml",
     ".yml": "application/yaml",
     ".toml": "application/toml",
     ".ini": "text/plain",
     ".cfg": "text/plain",
+    ".conf": "text/plain",
+    ".env": "text/plain",
+    ".properties": "text/plain",
+    ".gitignore": "text/plain",
+    ".dockerignore": "text/plain",
+    ".editorconfig": "text/plain",
+    ".py": "text/x-python",
+    ".js": "text/javascript",
+    ".ts": "text/typescript",
+    ".jsx": "text/javascript",
+    ".tsx": "text/typescript",
+    ".css": "text/css",
+    ".scss": "text/x-scss",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".sh": "text/x-shellscript",
+    ".bash": "text/x-shellscript",
+    ".zsh": "text/x-shellscript",
+    ".fish": "text/x-shellscript",
+    ".sql": "application/sql",
+    ".graphql": "application/graphql",
+    ".gql": "application/graphql",
     ".zip": "application/zip",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
+
+_NATIVE_DELIVERY_FILE_EXTS = frozenset(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp",
+        ".mp3", ".wav", ".ogg", ".m4a", ".opus", ".flac", ".aac",
+        ".epub", ".apk", ".ipa", ".odt", ".ods", ".odp", ".doc", ".xls", ".ppt",
+        ".tar", ".gz", ".tgz", ".bz2", ".xz", ".rar", ".7z",
+        *SUPPORTED_DOCUMENT_TYPES.keys(),
+    }
+)
+
+_NATIVE_DELIVERY_FILE_EXT_RE = "|".join(
+    sorted((re.escape(ext.lstrip(".")) for ext in _NATIVE_DELIVERY_FILE_EXTS), key=len, reverse=True)
+)
 
 
 def get_document_cache_dir() -> Path:
@@ -2127,7 +2167,9 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:'''
+            + _NATIVE_DELIVERY_FILE_EXT_RE
+            + r''')(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -2150,9 +2192,9 @@ class BasePlatformAdapter(ABC):
         Detect bare local file paths in response text for native media delivery.
 
         Matches absolute paths (/...) and tilde paths (~/) ending in common
-        image or video extensions.  Validates each candidate with
-        ``os.path.isfile()`` to avoid false positives from URLs or
-        non-existent paths.
+        image, video, audio, archive, office, code, or configuration file
+        extensions. Validates each candidate with ``os.path.isfile()`` to avoid
+        false positives from URLs or non-existent paths.
 
         Paths inside fenced code blocks (``` ... ```) and inline code
         (`...`) are ignored so that code samples are never mutilated.
@@ -2161,11 +2203,7 @@ class BasePlatformAdapter(ABC):
             Tuple of (list of expanded file paths, cleaned text with the
             raw path strings removed).
         """
-        _LOCAL_MEDIA_EXTS = (
-            '.png', '.jpg', '.jpeg', '.gif', '.webp',
-            '.mp4', '.mov', '.avi', '.mkv', '.webm',
-        )
-        ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
+        ext_part = _NATIVE_DELIVERY_FILE_EXT_RE
 
         # (?<![/:\w.]) prevents matching inside URLs (e.g. https://…/img.png)
         #             and relative paths (./foo.png)

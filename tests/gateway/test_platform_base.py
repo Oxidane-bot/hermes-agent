@@ -360,6 +360,27 @@ class TestExtractMedia:
         assert "[[audio_as_voice]]" not in cleaned
         assert "[[as_document]]" not in cleaned
 
+    @pytest.mark.parametrize(
+        "extension",
+        [
+            "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "properties",
+            "json", "jsonl", "xml", "tsv", "log", "py", "js", "ts", "tsx",
+            "css", "html", "sh", "sql", "graphql",
+        ],
+    )
+    def test_media_tag_supports_common_text_and_config_files(self, extension):
+        content = f"MEDIA:/tmp/generated-config.{extension}"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [(f"/tmp/generated-config.{extension}", False)]
+        assert cleaned == ""
+
+    def test_bare_local_config_path_is_detected(self, tmp_path):
+        config_path = tmp_path / "agent.config.yaml"
+        config_path.write_text("gateway: telegram\n", encoding="utf-8")
+        media, cleaned = BasePlatformAdapter.extract_local_files(str(config_path))
+        assert media == [str(config_path)]
+        assert cleaned == ""
+
 
 # ---------------------------------------------------------------------------
 # should_send_media_as_audio

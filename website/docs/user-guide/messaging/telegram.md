@@ -153,7 +153,7 @@ The gateway extracts `MEDIA:/path/to/file` tags from agent replies and ships the
 | Images | `png`, `jpg`, `jpeg`, `gif`, `webp`, `bmp`, `tiff`, `svg` |
 | Audio | `mp3`, `wav`, `ogg`, `m4a`, `opus`, `flac`, `aac` |
 | Video | `mp4`, `mov`, `webm`, `mkv`, `avi` |
-| **Documents** | `pdf`, `txt`, `md`, `csv`, `json`, `xml`, `html`, `yaml`, `yml`, `log` |
+| **Documents / data / config / code** | `pdf`, `txt`, `text`, `md`, `csv`, `tsv`, `json`, `jsonl`, `xml`, `html`, `htm`, `yaml`, `yml`, `toml`, `ini`, `cfg`, `conf`, `env`, `properties`, `log`, `py`, `js`, `ts`, `jsx`, `tsx`, `css`, `scss`, `sh`, `bash`, `zsh`, `fish`, `sql`, `graphql`, `gql`, `gitignore`, `dockerignore`, `editorconfig` |
 | **Office** | `docx`, `xlsx`, `pptx`, `odt`, `ods`, `odp` |
 | **Archives** | `zip`, `rar`, `7z`, `tar`, `gz`, `bz2` |
 | **Books / packages** | `epub`, `apk`, `ipa` |
