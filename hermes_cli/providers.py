@@ -20,7 +20,7 @@ Other modules import from this file.  No parallel registries.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import base_url_host_matches, base_url_hostname
@@ -228,6 +228,7 @@ class ProviderDef:
     base_url_env_var: str = ""
     is_aggregator: bool = False
     auth_type: str = "api_key"
+    request_headers: Dict[str, str] = field(default_factory=dict)
     doc: str = ""
     source: str = ""                      # "models.dev", "hermes", "user-config"
 
@@ -543,6 +544,39 @@ def determine_api_mode(provider: str, base_url: str = "") -> str:
 
 # -- Provider from user config ------------------------------------------------
 
+def _normalize_request_headers(raw: Any, *, provider_key: str = "") -> Dict[str, str]:
+    """Normalize provider-level request headers from config.yaml."""
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        preset = raw.strip().lower()
+        if preset == "browser":
+            return {
+                "Accept": "application/json,text/plain,*/*",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    preset = str(raw.get("preset") or "").strip().lower()
+    headers: Dict[str, str] = {}
+    if preset == "browser":
+        headers.update({
+            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+    elif preset:
+        logger.warning("providers.%s: unknown request_headers preset %r", provider_key or "?", preset)
+    for key, value in raw.items():
+        if key == "preset":
+            continue
+        if isinstance(key, str) and isinstance(value, str):
+            headers[key] = value
+    return headers
+
+
 def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[ProviderDef]:
     """Resolve a provider from the user's config.yaml ``providers:`` section.
 
@@ -565,6 +599,7 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     api_url = entry.get("api", "") or entry.get("url", "") or entry.get("base_url", "") or ""
     key_env = entry.get("key_env", "") or ""
     transport = entry.get("transport", "openai_chat") or "openai_chat"
+    request_headers = _normalize_request_headers(entry.get("request_headers") or entry.get("headers"), provider_key=name)
 
     env_vars: List[str] = []
     if key_env:
@@ -578,6 +613,7 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
         base_url=api_url,
         is_aggregator=False,
         auth_type="api_key",
+        request_headers=request_headers,
         source="user-config",
     )
 
@@ -626,7 +662,11 @@ def resolve_custom_provider(
 
         # Stash the first valid entry for bare-"custom" fallback
         if first_valid is None:
-            first_valid = (display_name, api_url)
+            first_valid = (
+                display_name,
+                api_url,
+                _normalize_request_headers(entry.get("request_headers") or entry.get("headers"), provider_key=display_name),
+            )
 
         slug = custom_provider_slug(display_name)
         if requested not in {display_name.lower(), slug}:
@@ -640,12 +680,13 @@ def resolve_custom_provider(
             base_url=api_url,
             is_aggregator=False,
             auth_type="api_key",
+            request_headers=_normalize_request_headers(entry.get("request_headers") or entry.get("headers"), provider_key=display_name),
             source="user-config",
         )
 
     # Self-heal: bare "custom" matched nothing — return first valid entry
     if bare_custom_fallback and first_valid:
-        dname, aurl = first_valid
+        dname, aurl, req_headers = first_valid
         slug = custom_provider_slug(dname)
         return ProviderDef(
             id=slug,
@@ -655,6 +696,7 @@ def resolve_custom_provider(
             base_url=aurl,
             is_aggregator=False,
             auth_type="api_key",
+            request_headers=req_headers,
             source="user-config",
         )
 

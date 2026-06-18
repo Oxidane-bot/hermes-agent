@@ -67,6 +67,7 @@ class ProviderProfile:
 
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
+    request_headers: dict[str, str] = field(default_factory=dict)
 
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send

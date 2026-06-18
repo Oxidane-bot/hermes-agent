@@ -739,6 +739,55 @@ class _CodexCompletionsAdapter:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
+
+            # Extract text and tool calls from Responses output. Items may be
+            # SDK objects (attrs) or dicts (raw/fallback paths), so use a helper
+            # that handles both shapes.  Keep this available to the exception
+            # recovery path too: SDK stream parsing can fail before
+            # get_final_response() returns.
+            def _item_get(obj: Any, key: str, default: Any = None) -> Any:
+                val = getattr(obj, key, None)
+                if val is None and isinstance(obj, dict):
+                    val = obj.get(key, default)
+                return val if val is not None else default
+
+            def _backfill_final_from_stream_parts(final_obj: Any) -> Any:
+                if final_obj is None:
+                    final_obj = SimpleNamespace(
+                        output=[],
+                        output_text="",
+                        status="completed",
+                        model=model,
+                        usage=None,
+                    )
+                _output = getattr(final_obj, "output", None)
+                if _output is None or (isinstance(_output, list) and not _output):
+                    if collected_output_items:
+                        final_obj.output = list(collected_output_items)
+                        logger.debug(
+                            "Codex auxiliary: backfilled %d output items from stream events",
+                            len(collected_output_items),
+                        )
+                    elif collected_text_deltas and not has_function_calls:
+                        # Only synthesize text when no tool calls were streamed —
+                        # a function_call response with incidental text should not
+                        # be collapsed into a plain-text message.
+                        assembled = "".join(collected_text_deltas)
+                        final_obj.output = [SimpleNamespace(
+                            type="message", role="assistant", status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )]
+                        if not getattr(final_obj, "output_text", None):
+                            try:
+                                final_obj.output_text = assembled
+                            except Exception:
+                                pass
+                        logger.debug(
+                            "Codex auxiliary: synthesized from %d deltas (%d chars)",
+                            len(collected_text_deltas), len(assembled),
+                        )
+                return final_obj
+
             _check_cancelled()
             with self._client.responses.stream(**resp_kwargs) as stream:
                 for _event in stream:
@@ -757,39 +806,10 @@ class _CodexCompletionsAdapter:
                 _check_cancelled()
                 final = stream.get_final_response()
 
-            # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
-                if collected_output_items:
-                    final.output = list(collected_output_items)
-                    logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
-                    )
-                elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
-                    )
+            # Backfill empty/null output from collected stream events.
+            final = _backfill_final_from_stream_parts(final)
 
-            # Extract text and tool calls from the Responses output.
-            # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
-            # so use a helper that handles both shapes.
-            def _item_get(obj: Any, key: str, default: Any = None) -> Any:
-                val = getattr(obj, key, None)
-                if val is None and isinstance(obj, dict):
-                    val = obj.get(key, default)
-                return val if val is not None else default
-
-            for item in getattr(final, "output", []):
+            for item in (getattr(final, "output", None) or []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):
@@ -816,8 +836,42 @@ class _CodexCompletionsAdapter:
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
-            logger.debug("Codex auxiliary Responses API call failed: %s", exc)
-            raise
+            if isinstance(exc, TypeError) and "'NoneType' object is not iterable" in str(exc):
+                if collected_output_items or (collected_text_deltas and not has_function_calls):
+                    logger.warning(
+                        "Codex auxiliary Responses stream parser saw a null terminal output; "
+                        "recovering from collected stream events."
+                    )
+                    final = _backfill_final_from_stream_parts(None)
+                    for item in (getattr(final, "output", None) or []):
+                        item_type = _item_get(item, "type")
+                        if item_type == "message":
+                            for part in (_item_get(item, "content") or []):
+                                ptype = _item_get(part, "type")
+                                if ptype in {"output_text", "text"}:
+                                    text_parts.append(_item_get(part, "text", ""))
+                        elif item_type == "function_call":
+                            tool_calls_raw.append(SimpleNamespace(
+                                id=_item_get(item, "call_id", ""),
+                                type="function",
+                                function=SimpleNamespace(
+                                    name=_item_get(item, "name", ""),
+                                    arguments=_item_get(item, "arguments", "{}"),
+                                ),
+                            ))
+                    resp_usage = getattr(final, "usage", None)
+                    if resp_usage:
+                        usage = SimpleNamespace(
+                            prompt_tokens=getattr(resp_usage, "input_tokens", 0),
+                            completion_tokens=getattr(resp_usage, "output_tokens", 0),
+                            total_tokens=getattr(resp_usage, "total_tokens", 0),
+                        )
+                else:
+                    logger.debug("Codex auxiliary Responses API call failed: %s", exc)
+                    raise
+            else:
+                logger.debug("Codex auxiliary Responses API call failed: %s", exc)
+                raise
         finally:
             if timeout_timer is not None:
                 timeout_timer.cancel()
@@ -2973,13 +3027,16 @@ def resolve_provider_client(
             elif base_url_host_matches(custom_base, "integrate.api.nvidia.com"):
                 extra["default_headers"] = build_nvidia_nim_headers(custom_base)
             else:
-                # Fall back to profile.default_headers for providers that
+                # Fall back to profile.default_headers/request_headers for providers that
                 # declare client-level attribution headers on their profile.
                 try:
                     from providers import get_provider_profile as _gpf_custom
                     _ph_custom = _gpf_custom(provider)
-                    if _ph_custom and _ph_custom.default_headers:
-                        extra["default_headers"] = dict(_ph_custom.default_headers)
+                    if _ph_custom:
+                        extra["default_headers"] = _merge_request_headers(
+                            getattr(_ph_custom, "default_headers", {}),
+                            getattr(_ph_custom, "request_headers", {}),
+                        )
                 except Exception:
                     pass
             client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)
@@ -3173,15 +3230,18 @@ def resolve_provider_client(
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
             headers.update(build_nvidia_nim_headers(base_url))
         else:
-            # Fall back to profile.default_headers for providers that declare
+            # Fall back to profile.default_headers/request_headers for providers that declare
             # client-level attribution headers on their profile (e.g. GMI
             # User-Agent for traffic identification, Vercel AI Gateway
             # Referer/Title for analytics).
             try:
                 from providers import get_provider_profile as _gpf_main
                 _ph_main = _gpf_main(provider)
-                if _ph_main and _ph_main.default_headers:
-                    headers.update(_ph_main.default_headers)
+                if _ph_main:
+                    headers.update(_merge_request_headers(
+                        getattr(_ph_main, "default_headers", {}),
+                        getattr(_ph_main, "request_headers", {}),
+                    ))
             except Exception:
                 pass
         client = OpenAI(api_key=api_key, base_url=base_url,

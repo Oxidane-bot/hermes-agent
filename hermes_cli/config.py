@@ -3148,14 +3148,14 @@ _KNOWN_ROOT_KEYS = {
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
-    "context_length", "rate_limit_delay",
+    "context_length", "rate_limit_delay", "request_headers", "headers",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py
     # — include it here so the set accurately describes the supported schema.
     "key_env",
 }
 
 # Fields that look like they should be inside custom_providers, not at root
-_CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
+_CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode", "request_headers", "headers"}
 
 
 @dataclass
@@ -4166,6 +4166,72 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
             return default
         node = node[key]
     return node
+
+
+
+def build_fallback_chain(config: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return the effective main-model fallback chain.
+
+    ``model.fallback_models`` defines model-level failover on the primary
+    provider, and those entries run before the provider-level
+    ``fallback_providers`` / legacy ``fallback_model`` chain.
+    """
+    if not isinstance(config, dict):
+        return []
+
+    chain: List[Dict[str, Any]] = []
+    model_cfg = config.get("model")
+    if isinstance(model_cfg, dict):
+        primary_provider = (model_cfg.get("provider") or "").strip()
+        primary_base_url = (model_cfg.get("base_url") or "").strip()
+        primary_api_mode = (model_cfg.get("api_mode") or "").strip()
+        raw_model_fallbacks = model_cfg.get("fallback_models") or []
+        if isinstance(raw_model_fallbacks, (str, dict)):
+            raw_model_fallbacks = [raw_model_fallbacks]
+        if isinstance(raw_model_fallbacks, list) and primary_provider:
+            for item in raw_model_fallbacks:
+                entry: Dict[str, Any]
+                if isinstance(item, str):
+                    model = item.strip()
+                    if not model:
+                        continue
+                    entry = {"provider": primary_provider, "model": model}
+                elif isinstance(item, dict):
+                    model = (item.get("model") or "").strip()
+                    if not model:
+                        continue
+                    entry = dict(item)
+                    entry.setdefault("provider", primary_provider)
+                else:
+                    continue
+                if primary_base_url and not entry.get("base_url"):
+                    entry["base_url"] = primary_base_url
+                if primary_api_mode and not entry.get("api_mode"):
+                    entry["api_mode"] = primary_api_mode
+                if entry.get("provider") and entry.get("model"):
+                    chain.append(entry)
+
+    raw_provider_fallbacks = config.get("fallback_providers") or config.get("fallback_model") or []
+    if isinstance(raw_provider_fallbacks, dict):
+        raw_provider_fallbacks = [raw_provider_fallbacks]
+    if isinstance(raw_provider_fallbacks, list):
+        for entry in raw_provider_fallbacks:
+            if isinstance(entry, dict) and entry.get("provider") and entry.get("model"):
+                chain.append(dict(entry))
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for entry in chain:
+        key = (
+            (entry.get("provider") or "").strip().lower(),
+            (entry.get("model") or "").strip(),
+            str(entry.get("base_url") or "").rstrip("/").lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
 
 
 

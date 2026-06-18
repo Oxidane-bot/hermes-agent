@@ -37,6 +37,36 @@ from utils import base_url_host_matches, base_url_hostname
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
 
+def _normalize_request_headers(raw: Any, *, provider_key: str = "") -> Dict[str, str]:
+    """Normalize provider-level request headers from config.yaml."""
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        preset = raw.strip().lower()
+        if preset == "browser":
+            return {
+                "Accept": "application/json,text/plain,*/*",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    preset = str(raw.get("preset") or "").strip().lower()
+    headers: Dict[str, str] = {}
+    if preset == "browser":
+        headers.update({
+            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+    for key, value in raw.items():
+        if key == "preset":
+            continue
+        if isinstance(key, str) and isinstance(value, str):
+            headers[key] = value
+    return headers
+
 
 def _loopback_hostname(host: str) -> bool:
     h = (host or "").lower().rstrip(".")
@@ -458,6 +488,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
+                        "request_headers": _normalize_request_headers(entry.get("request_headers") or entry.get("headers"), provider_key=ep_name),
                     }
                     # The v11→v12 migration writes the API mode under the new
                     # ``transport`` field, but hand-edited configs may still
@@ -483,6 +514,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                             "base_url": base_url.strip(),
                             "api_key": resolved_api_key,
                             "model": entry.get("default_model", ""),
+                            "request_headers": _normalize_request_headers(entry.get("request_headers") or entry.get("headers"), provider_key=display_name),
                         }
                         api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                         if api_mode:
@@ -521,6 +553,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             "name": name.strip(),
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
+            "request_headers": _normalize_request_headers(entry.get("request_headers") or entry.get("headers"), provider_key=name),
         }
         key_env = str(entry.get("key_env", "") or "").strip()
         if key_env:

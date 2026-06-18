@@ -15,6 +15,7 @@ Hermes can already talk to any OpenAI-compatible endpoint through the custom pro
 - a non-OpenAI API shape that needs an adapter
 
 If the provider is just "another OpenAI-compatible base URL and API key", a named custom provider may be enough.
+Named custom providers also support `request_headers` (including `preset: browser`) when a provider is happier with browser-like request metadata.
 
 ## The mental model
 

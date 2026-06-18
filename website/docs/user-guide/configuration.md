@@ -73,6 +73,27 @@ Multiple references in a single value work: `url: "${HOST}:${PORT}"`. If a refer
 
 For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-hosted LLMs, fallback models, etc.), see [AI Providers](/docs/integrations/providers).
 
+### Provider-level request headers
+
+You can set `providers.<id>.request_headers` to attach browser-style headers only for a specific provider.
+This is useful for OpenAI-compatible endpoints that are happier when requests look like they came from a normal browser.
+
+Example:
+
+```yaml
+providers:
+  kimi:
+    api: https://api.kimi.com/v1
+    key_env: KIMI_API_KEY
+    request_headers:
+      preset: browser
+      Origin: https://hermes.local
+      Referer: https://hermes.local/
+```
+
+`preset: browser` expands to a small browser-like header set, then any explicit keys in the same mapping override it.
+The same field is also accepted under `custom_providers:` entries.
+
 ### Provider Timeouts
 
 You can set `providers.<id>.request_timeout_seconds` for a provider-wide request timeout, plus `providers.<id>.models.<model>.timeout_seconds` for a model-specific override. Applies to the primary turn client on every transport (OpenAI-wire, native Anthropic, Anthropic-compatible), the fallback chain, rebuilds after credential rotation, and (for OpenAI-wire) the per-request timeout kwarg — so the configured value wins over the legacy `HERMES_API_TIMEOUT` env var.
