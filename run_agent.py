@@ -1698,14 +1698,17 @@ class AIAgent:
                     from agent.auxiliary_client import _codex_cloudflare_headers
                     client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
                 elif "default_headers" not in client_kwargs:
-                    # Fall back to profile.default_headers for providers that
+                    # Fall back to profile.default_headers/request_headers for providers that
                     # declare custom headers (e.g. Vercel AI Gateway attribution,
                     # Kimi User-Agent on non-kimi.com endpoints).
                     try:
                         from providers import get_provider_profile as _gpf
                         _ph = _gpf(self.provider)
-                        if _ph and _ph.default_headers:
-                            client_kwargs["default_headers"] = dict(_ph.default_headers)
+                        if _ph:
+                            headers = dict(getattr(_ph, "default_headers", {}))
+                            headers.update(getattr(_ph, "request_headers", {}))
+                            if headers:
+                                client_kwargs["default_headers"] = headers
                     except Exception:
                         pass
             else:
@@ -7048,6 +7051,88 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _backfill_codex_stream_output(
+        self,
+        response: Any,
+        *,
+        collected_output_items: list,
+        collected_text_deltas: list,
+        has_tool_calls: bool,
+        log_label: str,
+    ) -> Any:
+        """Repair malformed Responses stream terminals from collected events.
+
+        Some OpenAI-compatible Responses relays have been observed to stream
+        valid ``response.output_item.done`` / ``response.output_text.delta``
+        events, then send a terminal response whose ``output`` field is ``null``
+        (or an empty list).  The OpenAI SDK's high-level
+        ``responses.stream()`` parser can raise ``TypeError: 'NoneType' object
+        is not iterable`` while parsing that terminal response, before callers
+        can inspect it.  When we have already collected concrete streamed
+        output, preserve it instead of surfacing the SDK parser failure as a
+        local programming error.
+        """
+        if response is None:
+            return response
+
+        _out = getattr(response, "output", None)
+        if _out is None or (isinstance(_out, list) and not _out):
+            if collected_output_items:
+                response.output = list(collected_output_items)
+                logger.debug(
+                    "%s: backfilled %d output items from stream events",
+                    log_label,
+                    len(collected_output_items),
+                )
+            elif collected_text_deltas and not has_tool_calls:
+                assembled = "".join(collected_text_deltas)
+                response.output = [SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )]
+                if not getattr(response, "output_text", None):
+                    try:
+                        response.output_text = assembled
+                    except Exception:
+                        pass
+                logger.debug(
+                    "%s: synthesized output from %d text deltas (%d chars)",
+                    log_label,
+                    len(collected_text_deltas),
+                    len(assembled),
+                )
+        return response
+
+    @staticmethod
+    def _is_codex_stream_none_parse_error(exc: BaseException) -> bool:
+        return isinstance(exc, TypeError) and "'NoneType' object is not iterable" in str(exc)
+
+    def _codex_response_from_collected_stream_parts(
+        self,
+        *,
+        api_kwargs: dict,
+        collected_output_items: list,
+        collected_text_deltas: list,
+        has_tool_calls: bool,
+        log_label: str,
+    ) -> Any:
+        response = SimpleNamespace(
+            output=[],
+            output_text="",
+            status="completed",
+            model=api_kwargs.get("model"),
+            usage=None,
+        )
+        return self._backfill_codex_stream_output(
+            response,
+            collected_output_items=collected_output_items,
+            collected_text_deltas=collected_text_deltas,
+            has_tool_calls=has_tool_calls,
+            log_label=log_label,
+        )
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -7064,6 +7149,7 @@ class AIAgent:
             if self._interrupt_requested:
                 raise InterruptedError("Agent interrupted before Codex stream retry")
             collected_output_items: list = []
+            collected_text_deltas: list = []
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
@@ -7076,6 +7162,7 @@ class AIAgent:
                             delta_text = getattr(event, "delta", "")
                             if delta_text:
                                 self._codex_streamed_text_parts.append(delta_text)
+                                collected_text_deltas.append(delta_text)
                             if delta_text and not has_tool_calls:
                                 if not first_delta_fired:
                                     first_delta_fired = True
@@ -7117,27 +7204,13 @@ class AIAgent:
                     # PATCH: ChatGPT Codex backend streams valid output items
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
-                    _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
-                        if collected_output_items:
-                            final_response.output = list(collected_output_items)
-                            logger.debug(
-                                "Codex stream: backfilled %d output items from stream events",
-                                len(collected_output_items),
-                            )
-                        elif self._codex_streamed_text_parts and not has_tool_calls:
-                            assembled = "".join(self._codex_streamed_text_parts)
-                            final_response.output = [SimpleNamespace(
-                                type="message",
-                                role="assistant",
-                                status="completed",
-                                content=[SimpleNamespace(type="output_text", text=assembled)],
-                            )]
-                            logger.debug(
-                                "Codex stream: synthesized output from %d text deltas (%d chars)",
-                                len(self._codex_streamed_text_parts), len(assembled),
-                            )
-                    return final_response
+                    return self._backfill_codex_stream_output(
+                        final_response,
+                        collected_output_items=collected_output_items,
+                        collected_text_deltas=collected_text_deltas,
+                        has_tool_calls=has_tool_calls,
+                        log_label="Codex stream",
+                    )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -7150,6 +7223,38 @@ class AIAgent:
                     continue
                 logger.debug(
                     "Codex Responses stream transport failed; falling back to create(stream=True). %s error=%s",
+                    self._client_log_context(),
+                    exc,
+                )
+                return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            except TypeError as exc:
+                if not self._is_codex_stream_none_parse_error(exc):
+                    raise
+                if collected_output_items or (collected_text_deltas and not has_tool_calls):
+                    logger.warning(
+                        "Codex Responses stream parser saw a null terminal output; "
+                        "recovering from collected stream events. %s",
+                        self._client_log_context(),
+                    )
+                    return self._codex_response_from_collected_stream_parts(
+                        api_kwargs=api_kwargs,
+                        collected_output_items=collected_output_items,
+                        collected_text_deltas=collected_text_deltas,
+                        has_tool_calls=has_tool_calls,
+                        log_label="Codex stream parser recovery",
+                    )
+                if attempt < max_stream_retries:
+                    logger.debug(
+                        "Codex Responses stream parser failed on null terminal output "
+                        "(attempt %s/%s); retrying. %s",
+                        attempt + 1,
+                        max_stream_retries + 1,
+                        self._client_log_context(),
+                    )
+                    continue
+                logger.debug(
+                    "Codex Responses stream parser failed on null terminal output; "
+                    "falling back to create(stream=True). %s err=%s",
                     self._client_log_context(),
                     exc,
                 )
@@ -7220,6 +7325,7 @@ class AIAgent:
         terminal_response = None
         collected_output_items: list = []
         collected_text_deltas: list = []
+        has_function_calls = False
         try:
             for event in stream_or_response:
                 self._touch_activity("receiving stream response")
@@ -7240,6 +7346,8 @@ class AIAgent:
                         delta = event.get("delta", "")
                     if delta:
                         collected_text_deltas.append(delta)
+                elif "function_call" in str(event_type or ""):
+                    has_function_calls = True
 
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                     continue
@@ -7249,26 +7357,13 @@ class AIAgent:
                     terminal_response = event.get("response")
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
-                    _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
-                        if collected_output_items:
-                            terminal_response.output = list(collected_output_items)
-                            logger.debug(
-                                "Codex fallback stream: backfilled %d output items",
-                                len(collected_output_items),
-                            )
-                        elif collected_text_deltas:
-                            assembled = "".join(collected_text_deltas)
-                            terminal_response.output = [SimpleNamespace(
-                                type="message", role="assistant",
-                                status="completed",
-                                content=[SimpleNamespace(type="output_text", text=assembled)],
-                            )]
-                            logger.debug(
-                                "Codex fallback stream: synthesized from %d deltas (%d chars)",
-                                len(collected_text_deltas), len(assembled),
-                            )
-                    return terminal_response
+                    return self._backfill_codex_stream_output(
+                        terminal_response,
+                        collected_output_items=collected_output_items,
+                        collected_text_deltas=collected_text_deltas,
+                        has_tool_calls=has_function_calls,
+                        log_label="Codex fallback stream",
+                    )
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
@@ -9032,11 +9127,13 @@ class AIAgent:
             except Exception:
                 pass
 
-            # Determine api_mode from provider / base URL / model
-            fb_api_mode = "chat_completions"
+            # Determine api_mode from fallback entry / provider / base URL / model
+            fb_api_mode = (fb.get("api_mode") or "").strip() or "chat_completions"
             fb_base_url = str(fb_client.base_url)
             _fb_is_azure = self._is_azure_openai_url(fb_base_url)
-            if fb_provider == "openai-codex":
+            if fb.get("api_mode"):
+                pass
+            elif fb_provider == "openai-codex":
                 fb_api_mode = "codex_responses"
             elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
                 fb_api_mode = "anthropic_messages"

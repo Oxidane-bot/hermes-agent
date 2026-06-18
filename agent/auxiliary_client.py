@@ -3033,10 +3033,10 @@ def resolve_provider_client(
                     from providers import get_provider_profile as _gpf_custom
                     _ph_custom = _gpf_custom(provider)
                     if _ph_custom:
-                        extra["default_headers"] = _merge_request_headers(
-                            getattr(_ph_custom, "default_headers", {}),
-                            getattr(_ph_custom, "request_headers", {}),
-                        )
+                        headers = dict(getattr(_ph_custom, "default_headers", {}))
+                        headers.update(getattr(_ph_custom, "request_headers", {}))
+                        if headers:
+                            extra["default_headers"] = headers
                 except Exception:
                     pass
             client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)

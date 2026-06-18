@@ -159,6 +159,33 @@ def test_gmi_base_url_picks_up_profile_user_agent(mock_openai):
 
 
 @patch("run_agent.OpenAI")
+def test_profile_request_headers_are_preserved_on_client_build(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://custom.example.com/v1",
+        model="test/model",
+        provider="custom",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._client_kwargs = {
+        "api_key": "test-key",
+        "base_url": "https://custom.example.com/v1",
+    }
+
+    with patch("providers.get_provider_profile") as mock_profile:
+        mock_profile.return_value = SimpleNamespace(
+            default_headers={"X-Default": "1"},
+            request_headers={"X-Request": "2"},
+        )
+        agent._apply_client_headers_for_base_url("https://custom.example.com/v1")
+
+    assert agent._client_kwargs["default_headers"] == {"X-Default": "1"}
+
+
+@patch("run_agent.OpenAI")
 def test_unknown_base_url_clears_default_headers(mock_openai):
     mock_openai.return_value = MagicMock()
     agent = AIAgent(

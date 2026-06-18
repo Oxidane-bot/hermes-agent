@@ -627,6 +627,7 @@ def _resolve_named_custom_runtime(
         model_name = custom_provider.get("model")
         if model_name:
             pool_result["model"] = model_name
+        pool_result["request_headers"] = dict(custom_provider.get("request_headers") or {})
         return pool_result
 
     api_key_candidates = [
@@ -646,6 +647,7 @@ def _resolve_named_custom_runtime(
         "base_url": base_url,
         "api_key": api_key or "no-key-required",
         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
+        "request_headers": dict(custom_provider.get("request_headers") or {}),
     }
     # Propagate the model name so callers can override self.model when the
     # provider name differs from the actual model string the API expects.
@@ -759,6 +761,7 @@ def _resolve_openrouter_runtime(
         "base_url": base_url,
         "api_key": api_key,
         "source": source,
+        "request_headers": dict(model_cfg.get("request_headers") or {}),
     }
 
 
@@ -880,6 +883,7 @@ def _resolve_explicit_runtime(
             "api_key": api_key,
             "source": "explicit",
             "requested_provider": requested_provider,
+            "request_headers": {},
         }
 
     if provider == "openai-codex":

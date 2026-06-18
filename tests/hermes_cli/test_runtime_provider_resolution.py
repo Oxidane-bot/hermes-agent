@@ -59,6 +59,35 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
     assert resolved["base_url"] == "https://proxy.example.com/anthropic"
 
 
+def test_resolve_runtime_provider_custom_preserves_request_headers(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "custom",
+            "base_url": "https://custom.example.com/v1",
+            "request_headers": {
+                "preset": "browser",
+                "X-Test": "value",
+            },
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["request_headers"]["X-Test"] == "value"
+    assert resolved["request_headers"]["preset"] == "browser"
+
+
+def test_normalize_request_headers_browser_preset():
+    headers = rp._normalize_request_headers("browser", provider_key="custom")
+    assert headers["User-Agent"].startswith("Mozilla/5.0")
+    assert headers["Accept"] == "application/json,text/plain,*/*"
+    assert headers["Accept-Language"] == "zh-CN,zh;q=0.9,en;q=0.8"
+
+
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
     def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")
