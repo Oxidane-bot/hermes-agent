@@ -261,13 +261,19 @@ auxiliary:
     base_url: null                                    # Custom OpenAI-compatible endpoint
 ```
 
-And the fallback model uses:
+And the top-level fallback chain can use both model-level and provider-level entries:
 
 ```yaml
-fallback_model:
-  provider: openrouter
-  model: anthropic/claude-sonnet-4
-  # base_url: http://localhost:8000/v1               # Optional custom endpoint
+model:
+  provider: anthropic
+  fallback_models:
+    - claude-sonnet-4.6
+    - claude-haiku-4.5
+
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4
+    # base_url: http://localhost:8000/v1             # Optional custom endpoint
 ```
 
 For `auxiliary.session_search`, Hermes also supports:
@@ -293,7 +299,7 @@ All three — auxiliary, compression, fallback — work the same way: set `provi
 
 ### Provider Options for Auxiliary Tasks
 
-These options apply to `auxiliary:`, `compression:`, and `fallback_model:` configs only — `"main"` is **not** a valid value for your top-level `model.provider`. For custom endpoints, use `provider: custom` in your `model:` section (see [AI Providers](/docs/integrations/providers)).
+These options apply to `auxiliary:` and `compression:` configs, plus the top-level fallback chain (`model.fallback_models`, `fallback_providers`, and legacy `fallback_model`). `"main"` is **not** a valid value for your top-level `model.provider`. For custom endpoints, use `provider: custom` in your `model:` section (see [AI Providers](/docs/integrations/providers)).
 
 | Provider | Description | Requirements |
 |----------|-------------|-------------|
@@ -341,7 +347,7 @@ If no provider is available for compression, Hermes drops middle conversation tu
 
 ## Delegation Provider Override
 
-Subagents spawned by `delegate_task` do **not** use the primary fallback model. However, they can be routed to a different provider:model pair for cost optimization:
+Subagents spawned by `delegate_task` do **not** use the primary fallback chain. However, they can be routed to a different provider:model pair for cost optimization:
 
 ```yaml
 delegation:
@@ -357,7 +363,7 @@ See [Subagent Delegation](/docs/user-guide/features/delegation) for full configu
 
 ## Cron Job Providers
 
-Cron jobs run with whatever provider is configured at execution time. They do not support a fallback model. To use a different provider for cron jobs, configure `provider` and `model` overrides on the cron job itself:
+Cron jobs use the same top-level fallback chain as CLI and gateway sessions. If the primary provider fails, Hermes tries `model.fallback_models` first, then `fallback_providers` / legacy `fallback_model`. To use a different provider for the cron job itself, configure `provider` and `model` overrides on the cron job:
 
 ```python
 cronjob(
@@ -377,7 +383,7 @@ See [Scheduled Tasks (Cron)](/docs/user-guide/features/cron) for full configurat
 
 | Feature | Fallback Mechanism | Config Location |
 |---------|-------------------|----------------|
-| Main agent model | `fallback_model` in config.yaml — per-turn failover on errors (primary restored each turn) | `fallback_model:` (top-level) |
+| Main agent model | `model.fallback_models` first, then `fallback_providers` / legacy `fallback_model` — per-turn failover on errors (primary restored each turn) | `model:` + `fallback_providers:` |
 | Vision | Auto-detection chain + internal OpenRouter retry | `auxiliary.vision` |
 | Web extraction | Auto-detection chain + internal OpenRouter retry | `auxiliary.web_extract` |
 | Context compression | Auto-detection chain, degrades to no-summary if unavailable | `auxiliary.compression` |
@@ -388,4 +394,4 @@ See [Scheduled Tasks (Cron)](/docs/user-guide/features/cron) for full configurat
 | Title generation | Auto-detection chain | `auxiliary.title_generation` |
 | Triage specifier | Auto-detection chain | `auxiliary.triage_specifier` |
 | Delegation | Provider override only (no automatic fallback) | `delegation.provider` / `delegation.model` |
-| Cron jobs | Per-job provider override only (no automatic fallback) | Per-job `provider` / `model` |
+| Cron jobs | Same top-level fallback chain as CLI/gateway, plus optional per-job provider override | Top-level `model.fallback_models` / `fallback_providers` / `fallback_model`, plus per-job `provider` / `model` |
