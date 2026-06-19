@@ -24,13 +24,17 @@ Base: `v2026.4.30`
 
 | Commit | Description |
 |--------|-------------|
-| `a2eafd945` | file search fallback (rebased onto newer upstream) |
-| `e77ac1ab2` | memory read-before-write (rebased) |
-| `8e2e116b0` | stale streaming-provider failover (rebased) |
-| `7d51bf35f` | context-compression fail-closed (rebased) |
-| `c931c2131` | rebind telegram topics after compression |
-| `ac1fdc913` | approval reviewer fallback chain |
-| `b5253c827` | auxiliary compaction replay real Responses turns |
+| `3c3d51d09` | file search fd fallback when `rg` is unavailable |
+| `6fa29bc07` | memory read-before-write behavior |
+| `d64b0368e` | stale streaming-provider failover |
+| `254e23937` | context-compression fail-closed behavior |
+| `bd5f627a2` | rebind telegram topics after compression |
+| `497de707a` | approval reviewer fallback chain |
+| `32b94c7e4` | auxiliary compaction replay real Responses turns |
+| `aa4f1d524` | expand native file attachment extensions |
+| `a3bd27c43` | provider-level request headers (config + auxiliary client) |
+| `1f3703dff` | provider-level browser/attribution headers in agent runtime |
+| `93d9056d2` | unify fallback chain (`fallback_models` + `fallback_providers`) and gateway clarify replies |
 
 ### Uncommitted
 
