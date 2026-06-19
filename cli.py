@@ -2751,13 +2751,10 @@ class HermesCLI:
             except (TypeError, ValueError):
                 pass
         
-        # Fallback provider chain — tried in order when primary fails after retries.
-        # Supports new list format (fallback_providers) and legacy single-dict (fallback_model).
-        fb = CLI_CONFIG.get("fallback_providers") or CLI_CONFIG.get("fallback_model") or []
-        # Normalize legacy single-dict to a one-element list
-        if isinstance(fb, dict):
-            fb = [fb] if fb.get("provider") and fb.get("model") else []
-        self._fallback_model = fb
+        # Fallback chain — model.fallback_models on the primary provider first,
+        # then provider-level fallback_providers / legacy fallback_model.
+        from hermes_cli.config import build_fallback_chain
+        self._fallback_model = build_fallback_chain(CLI_CONFIG)
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across

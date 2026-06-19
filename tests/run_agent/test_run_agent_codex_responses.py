@@ -188,6 +188,21 @@ class _FakeCreateStream:
         self.closed = True
 
 
+class _FakeBrokenParsedResponsesStream:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.output_text.delta", delta="Recovered")
+        raise TypeError("'NoneType' object is not iterable")
+
+    def get_final_response(self):
+        raise AssertionError("parser failure should happen during iteration")
+
+
 def _codex_request_kwargs():
     return {
         "model": "gpt-5-codex",
@@ -483,6 +498,56 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_run_codex_stream_recovers_from_null_terminal_parser_error(monkeypatch):
+    """CIII-style relays can stream valid deltas then send output=null in
+    response.completed. The OpenAI SDK raises TypeError while parsing that
+    terminal event; Hermes should recover from already-collected deltas instead
+    of treating it as a local non-retryable bug."""
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeBrokenParsedResponsesStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("should not need network fallback")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
+    assert response.output[0].content[0].text == "Recovered"
+    assert response.output_text == "Recovered"
+
+
+def test_run_codex_create_stream_fallback_backfills_null_terminal_output(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    terminal = SimpleNamespace(output=None, output_text=None, status="completed", model="gpt-5-codex")
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="fallback text"),
+            SimpleNamespace(type="response.completed", response=terminal),
+        ]
+    )
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: create_stream)
+    )
+
+    response = agent._run_codex_create_stream_fallback(_codex_request_kwargs())
+
+    assert create_stream.closed is True
+    assert response is terminal
+    assert response.output[0].content[0].text == "fallback text"
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):

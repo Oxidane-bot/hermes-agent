@@ -19,6 +19,7 @@ from hermes_cli.config import (
     save_env_value,
     save_env_value_secure,
     sanitize_env_file,
+    build_fallback_chain,
     _sanitize_env_lines,
 )
 
@@ -725,6 +726,52 @@ class TestDiscordChannelPromptsConfig:
         assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert raw["discord"]["auto_thread"] is True
         assert raw["discord"]["channel_prompts"] == {}
+
+
+class TestFallbackChainConfig:
+    def test_model_fallbacks_precede_provider_fallbacks(self):
+        chain = build_fallback_chain({
+            "model": {
+                "provider": "custom:primary",
+                "base_url": "https://custom.example.com/v1",
+                "api_mode": "codex_responses",
+                "fallback_models": ["gpt-5.4"],
+            },
+            "fallback_providers": [
+                {"provider": "zai", "model": "glm-5.1"},
+                {"provider": "custom:secondary", "model": "gemini-3.5-flash"},
+            ],
+        })
+
+        assert chain == [
+            {
+                "provider": "custom:primary",
+                "model": "gpt-5.4",
+                "base_url": "https://custom.example.com/v1",
+                "api_mode": "codex_responses",
+            },
+            {"provider": "zai", "model": "glm-5.1"},
+            {"provider": "custom:secondary", "model": "gemini-3.5-flash"},
+        ]
+
+    def test_model_fallbacks_deduplicate_existing_provider_entry(self):
+        chain = build_fallback_chain({
+            "model": {
+                "provider": "custom:primary",
+                "base_url": "https://custom.example.com/v1/",
+                "fallback_models": ["gpt-5.4"],
+            },
+            "fallback_providers": [
+                {
+                    "provider": "custom:primary",
+                    "model": "gpt-5.4",
+                    "base_url": "https://custom.example.com/v1",
+                },
+                {"provider": "zai", "model": "glm-5.1"},
+            ],
+        })
+
+        assert [entry["model"] for entry in chain] == ["gpt-5.4", "glm-5.1"]
 
 
 class TestUserMessagePreviewConfig:

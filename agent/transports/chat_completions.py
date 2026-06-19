@@ -12,6 +12,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 import copy
 from typing import Any, Dict, List, Optional
 
+from agent.gemini_schema import sanitize_gemini_tool_parameters
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
@@ -19,14 +20,49 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+def _normalized_model_leaf(model: str) -> str:
+    normalized = (model or "").strip().lower()
+    if "/" in normalized:
+        normalized = normalized.rsplit("/", 1)[1]
+    return normalized
+
+
+def _is_gemini_model(model: str) -> bool:
+    return _normalized_model_leaf(model).startswith("gemini")
+
+
+def _sanitize_gemini_openai_compat_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sanitize OpenAI-format function tools for Gemini-backed chat relays.
+
+    Some OpenAI-compatible Gemini aggregators translate ``tools`` into Gemini
+    ``function_declarations`` server-side. Gemini's schema validator requires
+    enum values to be strings even for integer properties, so raw OpenAI tool
+    schemas like Discord's ``auto_archive_duration`` numeric enum are rejected
+    before the model runs. Keep the OpenAI wrapper shape, but sanitize the
+    nested parameter schema with the Gemini rules already used by native Gemini
+    adapters.
+    """
+    sanitized: List[Dict[str, Any]] = []
+    changed = False
+    for tool in tools:
+        out = copy.deepcopy(tool)
+        fn = out.get("function") if isinstance(out, dict) else None
+        if isinstance(fn, dict):
+            params = fn.get("parameters")
+            repaired = sanitize_gemini_tool_parameters(params)
+            if repaired != params:
+                changed = True
+                fn["parameters"] = repaired
+        sanitized.append(out)
+    return sanitized if changed else tools
+
+
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
     """Translate Hermes/OpenRouter-style reasoning config to Gemini thinkingConfig."""
     if reasoning_config is None or not isinstance(reasoning_config, dict):
         return None
 
-    normalized_model = (model or "").strip().lower()
-    if normalized_model.startswith("google/"):
-        normalized_model = normalized_model.split("/", 1)[1]
+    normalized_model = _normalized_model_leaf(model)
 
     # ``thinking_config`` is a Gemini-only request parameter. The same
     # ``gemini`` provider also serves Gemma (and historically PaLM/Bard);
@@ -244,6 +280,8 @@ class ChatCompletionsTransport(ProviderTransport):
 
         # Tools
         if tools:
+            if _is_gemini_model(model):
+                tools = _sanitize_gemini_openai_compat_tools(tools)
             # Moonshot/Kimi uses a stricter flavored JSON Schema.  Rewriting
             # tool parameters here keeps aggregator routes (Nous, OpenRouter,
             # etc.) compatible, in addition to direct moonshot.ai endpoints.
@@ -435,6 +473,8 @@ class ChatCompletionsTransport(ProviderTransport):
 
         # Tools — apply Moonshot/Kimi schema sanitization regardless of path
         if tools:
+            if _is_gemini_model(model):
+                tools = _sanitize_gemini_openai_compat_tools(tools)
             if is_moonshot_model(model):
                 tools = sanitize_moonshot_tools(tools)
             api_kwargs["tools"] = tools

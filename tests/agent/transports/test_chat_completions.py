@@ -72,6 +72,106 @@ class TestChatCompletionsBuildKwargs:
         kw = transport.build_kwargs(model="gpt-4o", messages=msgs, tools=tools)
         assert kw["tools"] == tools
 
+    def test_gemini_model_sanitizes_numeric_enums_in_tool_schemas(self, transport):
+        """OpenAI-compatible Gemini relays translate tools to Gemini
+        function_declarations, whose enum entries must be strings. Numeric
+        OpenAI enums should be removed before the request reaches the relay."""
+        msgs = [{"role": "user", "content": "Hi"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "discord_thread",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "auto_archive_duration": {
+                                "type": "integer",
+                                "enum": [60, 1440, 4320, 10080],
+                                "description": "Minutes.",
+                            },
+                        },
+                    },
+                },
+            },
+        ]
+
+        kw = transport.build_kwargs(
+            model="gemini-3.5-flash",
+            messages=msgs,
+            tools=tools,
+        )
+
+        prop = kw["tools"][0]["function"]["parameters"]["properties"]["auto_archive_duration"]
+        assert prop["type"] == "integer"
+        assert "enum" not in prop
+        # Original registry schema remains untouched.
+        assert tools[0]["function"]["parameters"]["properties"]["auto_archive_duration"]["enum"] == [
+            60, 1440, 4320, 10080,
+        ]
+
+    def test_google_prefixed_gemini_model_sanitizes_tool_schemas(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "discord_thread",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "auto_archive_duration": {
+                                "type": "integer",
+                                "enum": [60, 1440],
+                            },
+                        },
+                    },
+                },
+            },
+        ]
+
+        kw = transport.build_kwargs(
+            model="google/gemini-3.5-flash",
+            messages=msgs,
+            tools=tools,
+        )
+
+        prop = kw["tools"][0]["function"]["parameters"]["properties"]["auto_archive_duration"]
+        assert "enum" not in prop
+
+    def test_custom_profile_gemini_model_sanitizes_tool_schemas(self, transport):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "discord_thread",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "auto_archive_duration": {
+                                "type": "integer",
+                                "enum": [60, 1440],
+                            },
+                        },
+                    },
+                },
+            },
+        ]
+
+        kw = transport.build_kwargs(
+            model="gemini-3.5-flash",
+            messages=msgs,
+            tools=tools,
+            provider_profile=profile,
+        )
+
+        prop = kw["tools"][0]["function"]["parameters"]["properties"]["auto_archive_duration"]
+        assert "enum" not in prop
+
     def test_openrouter_provider_prefs(self, transport):
         from providers import get_provider_profile
         profile = get_provider_profile("openrouter")

@@ -10,7 +10,7 @@ sidebar_position: 8
 Hermes Agent has three layers of resilience that keep your sessions running when providers hit issues:
 
 1. **[Credential pools](./credential-pools.md)** — rotate across multiple API keys for the *same* provider (tried first)
-2. **Primary model fallback** — automatically switches to a *different* provider:model when your main model fails
+2. **Primary model fallback** — first try `model.fallback_models` on the primary provider, then switch to a *different* provider:model when needed
 3. **Auxiliary task fallback** — independent provider resolution for side tasks like vision, compression, and web extraction
 
 Credential pools handle same-provider rotation (e.g., multiple OpenRouter keys). This page covers cross-provider fallback. Both are optional and work independently.
@@ -27,7 +27,7 @@ The easiest path is the interactive manager:
 hermes fallback
 ```
 
-`hermes fallback` reuses the provider picker from `hermes model` — same provider list, same credential prompts, same validation. Use the subcommands `add`, `list` (alias `ls`), `remove` (alias `rm`), and `clear` to manage the chain. Changes persist under the top-level `fallback_providers:` list in `config.yaml`.
+`hermes fallback` reuses the provider picker from `hermes model` — same provider list, same credential prompts, same validation. Use the subcommands `add`, `list` (alias `ls`), `remove` (alias `rm`), and `clear` to manage the chain. Changes persist under the top-level `fallback_providers:` list in `config.yaml`. If you want the primary provider to try extra models first, set `model.fallback_models` under the main `model:` block.
 
 If you'd rather edit the YAML directly, add a `fallback_model` section to `~/.hermes/config.yaml`:
 
@@ -40,7 +40,7 @@ fallback_model:
 Both `provider` and `model` are **required**. If either is missing, the fallback is disabled.
 
 :::note `fallback_model` vs `fallback_providers`
-`fallback_model` (singular) is the legacy single-fallback key — Hermes still honors it for back-compat. `fallback_providers` (plural, list) supports multiple fallbacks tried in order; `hermes fallback` writes to this key. When both are set, Hermes merges them with `fallback_providers` taking priority.
+`model.fallback_models` are tried first on the primary provider. After that, `fallback_providers` (plural, list) is the preferred provider-level chain and `fallback_model` (singular) remains as legacy back-compat. `hermes fallback` writes to `fallback_providers`. If both provider-level keys are set, Hermes uses `fallback_providers` and ignores the legacy key.
 :::
 
 ### Supported Providers
@@ -168,7 +168,7 @@ fallback_model:
 | CLI sessions | ✔ |
 | Messaging gateway (Telegram, Discord, etc.) | ✔ |
 | Subagent delegation | ✘ (subagents do not inherit fallback config) |
-| Cron jobs | ✘ (run with a fixed provider) |
+| Cron jobs | ✔ (use the same fallback chain when the primary auth or runtime provider fails) |
 | Auxiliary tasks (vision, compression) | ✘ (use their own provider chain — see below) |
 
 :::tip
