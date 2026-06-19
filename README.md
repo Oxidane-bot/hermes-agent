@@ -16,6 +16,12 @@
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [NovitaAI](https://novita.ai) (AI-native cloud for Model API, Agent Sandbox, and GPU Cloud), [NVIDIA NIM](https://build.nvidia.com) (Nemotron), [Xiaomi MiMo](https://platform.xiaomimimo.com), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), [Hugging Face](https://huggingface.co), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
 
+## Local fork notes
+
+This fork keeps a tracked patch stack for the Hermes setup I run day to day. The current local changes include file-search fallback, memory read-before-write behavior, stale streaming-provider failover, context-compression fail-closed behavior, Telegram topic rebind after compression, the reviewer fallback chain, compaction replay of real Responses turns, provider-level request/browser headers, native file attachment extensions, and the unified fallback chain (`fallback_models` + `fallback_providers`).
+
+For the detailed commit stack, see [`README.local.md`](README.local.md).
+
 <table>
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
