@@ -25,6 +25,8 @@ summarizes what is special about this fork.
 
 ## Maintained feature set
 
+This fork keeps a tracked patch stack for the Hermes setup I run day to day. The current local changes include file-search fallback, memory read-before-write behavior, stale streaming-provider failover, context-compression fail-closed behavior, Telegram topic rebind after compression, the reviewer fallback chain, compaction replay of real Responses turns, provider-level request/browser headers, native file attachment extensions, the unified fallback chain (`fallback_models` + `fallback_providers`), and a Telegram proxy rotation helper (`gateway/telegram_proxy_rotation.py` + `gateway/telegram_rotation_client.py` + `gateway/telegram_rotation_supervisor.py`) that talks to the local Clash/Mihomo controller on `127.0.0.1:9090`.
+
 | Feature | User-facing value | Representative commits |
 |---|---|---|
 | Goal automation | `/goal` survives session compression and stops on evidence of completion instead of looping on bare “done” text. The judge timeout is configurable, so the stronger main model can be used reliably. | `6f98baee4`, `b0b6a411` |

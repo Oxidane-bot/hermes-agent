@@ -22,6 +22,11 @@ This branch is Oxidane's personal maintenance branch for a public fork of NousRe
 
 ## Test notes
 
+- Telegram proxy rotation helper is now split into three pieces:
+  - `gateway/telegram_proxy_rotation.py` for Clash/Mihomo rotation
+  - `gateway/telegram_rotation_client.py` for fire-and-forget event reporting
+  - `gateway/telegram_rotation_supervisor.py` for companion-process lifecycle
+
 Run targeted tests with:
 
 ```bash
@@ -30,7 +35,12 @@ python -m pytest -o 'addopts=' tests/cli/test_cli_init.py tests/run_agent/test_p
 
 Use `-o 'addopts='` when the local test environment lacks optional pytest plugins referenced by repository defaults.
 
+<<<<<<< HEAD
 ## Privacy notes
+=======
+- independent Anthropic fast-mode and Codex priority configurations (live code only, not yet in fork)
+- Telegram proxy rotation helper: `gateway/telegram_proxy_rotation.py` (Clash/Mihomo selector switching via `127.0.0.1:9090`) + `gateway/telegram_rotation_client.py` (fire-and-forget failure event reporting) + hooks in `gateway/platforms/telegram.py` (polling network error, heartbeat probe failure)
+>>>>>>> e35e3f1ab (Add Telegram proxy rotation companion)
 
 - Do not commit profile configs, `.env`, auth files, sessions, logs, or request dumps.
 - Keep custom provider endpoints and provider-specific slugs out of public documentation and source comments.
