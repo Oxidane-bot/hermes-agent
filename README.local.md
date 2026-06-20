@@ -39,6 +39,7 @@ Base: `v2026.4.30`
 ### Uncommitted
 
 - independent Anthropic fast-mode and Codex priority configurations (live code only, not yet in fork)
+- Telegram proxy rotation helper: `gateway/telegram_proxy_rotation.py` (Clash/Mihomo selector switching via `127.0.0.1:9090`) + `gateway/telegram_rotation_client.py` (fire-and-forget failure event reporting) + hooks in `gateway/platforms/telegram.py` (polling network error, heartbeat probe failure)
 
 ## Upstream sync model
 

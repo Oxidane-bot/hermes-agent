@@ -18,7 +18,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ## Local fork notes
 
-This fork keeps a tracked patch stack for the Hermes setup I run day to day. The current local changes include file-search fallback, memory read-before-write behavior, stale streaming-provider failover, context-compression fail-closed behavior, Telegram topic rebind after compression, the reviewer fallback chain, compaction replay of real Responses turns, provider-level request/browser headers, native file attachment extensions, and the unified fallback chain (`fallback_models` + `fallback_providers`).
+This fork keeps a tracked patch stack for the Hermes setup I run day to day. The current local changes include file-search fallback, memory read-before-write behavior, stale streaming-provider failover, context-compression fail-closed behavior, Telegram topic rebind after compression, the reviewer fallback chain, compaction replay of real Responses turns, provider-level request/browser headers, native file attachment extensions, the unified fallback chain (`fallback_models` + `fallback_providers`), and a Telegram proxy rotation helper (`gateway/telegram_proxy_rotation.py` + `gateway/telegram_rotation_client.py`) that talks to the local Clash/Mihomo controller on `127.0.0.1:9090`.
 
 For the detailed commit stack, see [`README.local.md`](README.local.md).
 

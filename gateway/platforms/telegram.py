@@ -83,6 +83,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.telegram_rotation_client import report_telegram_rotation_event
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -871,6 +872,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
                 self.name, HEARTBEAT_PROBE_DELAY, probe_err,
             )
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                profile_id = get_active_profile_name() or "default"
+            except Exception:
+                profile_id = "default"
+            report_telegram_rotation_event(
+                error=probe_err,
+                event_type="heartbeat_probe_failed",
+                retryable=True,
+                source="gateway.platforms.telegram.TelegramAdapter._verify_polling_after_reconnect",
+                mode="polling",
+                profile_id=profile_id,
+                meta={"platform": self.platform.value, "heartbeat_delay_s": HEARTBEAT_PROBE_DELAY},
+            )
             await self._handle_polling_network_error(probe_err)
 
     async def _handle_polling_conflict(self, error: Exception) -> None:
@@ -1379,6 +1394,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._polling_error_task = loop.create_task(self._handle_polling_conflict(error))
                     elif self._looks_like_network_error(error):
                         logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, error)
+                        try:
+                            from hermes_cli.profiles import get_active_profile_name
+                            profile_id = get_active_profile_name() or "default"
+                        except Exception:
+                            profile_id = "default"
+                        report_telegram_rotation_event(
+                            error=error,
+                            event_type="polling_network_error",
+                            attempt=self._polling_network_error_count + 1,
+                            retryable=True,
+                            source="gateway.platforms.telegram.TelegramAdapter._polling_error_callback",
+                            mode="polling",
+                            profile_id=profile_id,
+                            meta={"platform": self.platform.value, "bot_name": getattr(self.config, 'name', None)},
+                        )
                         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
                     else:
                         logger.error("[%s] Telegram polling error: %s", self.name, error, exc_info=True)
