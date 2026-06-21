@@ -120,3 +120,8 @@ class TestClashClient:
     def test_client_can_be_constructed(self):
         client = ClashClient("http://127.0.0.1:9090")
         assert client.controller_url == "http://127.0.0.1:9090"
+
+    def test_client_accepts_multiple_controller_urls(self):
+        client = ClashClient(["http://127.0.0.1:19090", "http://127.0.0.1:9090"])
+        assert client.controller_urls == ("http://127.0.0.1:19090", "http://127.0.0.1:9090")
+        assert client.controller_url == "http://127.0.0.1:19090"

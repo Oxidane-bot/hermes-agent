@@ -22,25 +22,28 @@ This branch is Oxidane's personal maintenance branch for a public fork of NousRe
 
 ## Test notes
 
-- Telegram proxy rotation helper is now split into three pieces:
+- Telegram proxy rotation helper is split into three pieces:
   - `gateway/telegram_proxy_rotation.py` for Clash/Mihomo rotation
   - `gateway/telegram_rotation_client.py` for fire-and-forget event reporting
   - `gateway/telegram_rotation_supervisor.py` for companion-process lifecycle
+- Controller ports are tried in this order by default:
+  - `127.0.0.1:9090`
+  - `127.0.0.1:19090`
+- The helper treats both ports as the same control surface:
+  - it probes `/version`, `/proxies/{selector}`, `/proxies/{selector}/delay`, and selector `PUT` calls against the first live controller URL
+  - if the first port fails, it falls back to the second port automatically
+  - if a request succeeds on the fallback port, that port becomes the active controller URL for the current helper instance
+- CLI override stays available through `--controller-url`; the flag also accepts a comma-separated list if needed.
 
-Run targeted tests with:
+Run the targeted test with:
 
 ```bash
-python -m pytest -o 'addopts=' tests/cli/test_cli_init.py tests/run_agent/test_provider_fallback.py tests/gateway/test_session_model_override_routing.py tests/cron/test_scheduler.py tests/gateway/test_telegram_documents.py -q
+python -m pytest -o 'addopts=' tests/gateway/test_telegram_proxy_rotation.py -q
 ```
 
 Use `-o 'addopts='` when the local test environment lacks optional pytest plugins referenced by repository defaults.
 
-<<<<<<< HEAD
 ## Privacy notes
-=======
-- independent Anthropic fast-mode and Codex priority configurations (live code only, not yet in fork)
-- Telegram proxy rotation helper: `gateway/telegram_proxy_rotation.py` (Clash/Mihomo selector switching via `127.0.0.1:9090`) + `gateway/telegram_rotation_client.py` (fire-and-forget failure event reporting) + hooks in `gateway/platforms/telegram.py` (polling network error, heartbeat probe failure)
->>>>>>> e35e3f1ab (Add Telegram proxy rotation companion)
 
 - Do not commit profile configs, `.env`, auth files, sessions, logs, or request dumps.
 - Keep custom provider endpoints and provider-specific slugs out of public documentation and source comments.

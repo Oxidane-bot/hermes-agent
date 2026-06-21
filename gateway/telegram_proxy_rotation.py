@@ -22,7 +22,8 @@ from urllib import request as urllib_request
 
 LOG = logging.getLogger(__name__)
 
-DEFAULT_CONTROLLER_URL = "http://127.0.0.1:9090"
+DEFAULT_CONTROLLER_URLS = ("http://127.0.0.1:9090", "http://127.0.0.1:19090")
+DEFAULT_CONTROLLER_URL = DEFAULT_CONTROLLER_URLS[0]
 DEFAULT_SELECTOR_NAME = "电报消息"
 DEFAULT_TEST_URL = "https://api.telegram.org"
 DEFAULT_DELAY_TIMEOUT_MS = 5000
@@ -100,9 +101,19 @@ class ClashAPI(Protocol):
 
 
 class ClashClient:
-    def __init__(self, controller_url: str = DEFAULT_CONTROLLER_URL, timeout: float = DEFAULT_HTTP_TIMEOUT):
-        self.controller_url = controller_url.rstrip("/")
+    def __init__(self, controller_url: str | Sequence[str] = DEFAULT_CONTROLLER_URLS, timeout: float = DEFAULT_HTTP_TIMEOUT):
+        self.controller_urls = _normalize_controller_urls(controller_url)
+        self.controller_url = self.controller_urls[0]
         self.timeout = timeout
+
+    def _controller_attempts(self) -> list[str]:
+        attempts: list[str] = []
+        for url in self.controller_urls:
+            if url and url not in attempts:
+                attempts.append(url)
+        if self.controller_url and self.controller_url not in attempts:
+            attempts.insert(0, self.controller_url)
+        return attempts
 
     def _json(self, method: str, path: str, payload: dict | None = None, timeout: float | None = None) -> dict:
         data = None
@@ -110,29 +121,39 @@ class ClashClient:
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        req = urllib_request.Request(
-            f"{self.controller_url}{path}",
-            data=data,
-            method=method,
-            headers=headers,
-        )
-        try:
-            with urllib_request.urlopen(req, timeout=timeout or self.timeout) as resp:
-                raw = resp.read()
-        except urllib_error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise ClashAPIError(f"HTTP {exc.code} for {path}: {body}") from exc
-        except urllib_error.URLError as exc:
-            raise ClashAPIError(f"Failed to reach Clash API at {self.controller_url}: {exc}") from exc
-        if not raw:
-            return {}
-        try:
-            decoded = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ClashAPIError(f"Invalid JSON from {path}: {raw[:200]!r}") from exc
-        if not isinstance(decoded, dict):
-            raise ClashAPIError(f"Expected JSON object from {path}, got {type(decoded).__name__}")
-        return decoded
+
+        last_error: Exception | None = None
+        for controller_url in self._controller_attempts():
+            req = urllib_request.Request(
+                f"{controller_url}{path}",
+                data=data,
+                method=method,
+                headers=headers,
+            )
+            try:
+                with urllib_request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                    raw = resp.read()
+            except urllib_error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                raise ClashAPIError(f"HTTP {exc.code} for {path}: {body}") from exc
+            except (urllib_error.URLError, OSError) as exc:
+                last_error = exc
+                continue
+
+            self.controller_url = controller_url
+            if not raw:
+                return {}
+            try:
+                decoded = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ClashAPIError(f"Invalid JSON from {path}: {raw[:200]!r}") from exc
+            if not isinstance(decoded, dict):
+                raise ClashAPIError(f"Expected JSON object from {path}, got {type(decoded).__name__}")
+            return decoded
+
+        if last_error is not None:
+            raise ClashAPIError(f"Failed to reach Clash API at any configured controller URL: {last_error}") from last_error
+        raise ClashAPIError("Failed to reach Clash API at any configured controller URL")
 
     def version(self) -> dict:
         return self._json("GET", "/version")
@@ -168,6 +189,22 @@ TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)")
 
 def _quote_path(value: str) -> str:
     return urllib_parse.quote(value, safe="")
+
+
+def _normalize_controller_urls(controller_url: str | Sequence[str] | None) -> tuple[str, ...]:
+    if controller_url is None:
+        raw_urls: list[str] = list(DEFAULT_CONTROLLER_URLS)
+    elif isinstance(controller_url, str):
+        raw_urls = [item.strip() for item in controller_url.split(",")]
+    else:
+        raw_urls = [str(item).strip() for item in controller_url]
+
+    urls: list[str] = []
+    for url in raw_urls:
+        normalized = url.rstrip("/")
+        if normalized and normalized not in urls:
+            urls.append(normalized)
+    return tuple(urls or DEFAULT_CONTROLLER_URLS)
 
 
 def _now() -> float:
