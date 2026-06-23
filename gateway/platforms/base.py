@@ -1078,6 +1078,7 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".toml": "application/toml",
     ".ini": "text/plain",
     ".cfg": "text/plain",
+    ".env": "text/plain",
     ".zip": "application/zip",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2474,7 +2475,7 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|tar|gz|tgz|bz2|xz|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|tar|gz|tgz|bz2|xz|rar|7z|docx?|xlsx?|pptx?|txt|csv|env(?:\.[\w.-]+)?|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -2524,7 +2525,7 @@ class BasePlatformAdapter(ABC):
             # Audio (delivered as voice/audio where supported)
             '.mp3', '.wav', '.ogg', '.m4a', '.flac',
             # Documents (uploaded as file attachments)
-            '.pdf', '.docx', '.doc', '.odt', '.rtf', '.txt', '.md',
+            '.pdf', '.docx', '.doc', '.odt', '.rtf', '.txt', '.md', '.env',
             # Spreadsheets / data
             '.xlsx', '.xls', '.ods', '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml',
             # Presentations
@@ -2535,12 +2536,14 @@ class BasePlatformAdapter(ABC):
             '.html', '.htm',
         )
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
+        env_ext_part = r'env(?:\.[\w.\-]+)?'
 
         # (?<![/:\w.]) prevents matching inside URLs (e.g. https://…/img.png)
         #             and relative paths (./foo.png)
         # (?:~/|/)    anchors to absolute or home-relative paths
         path_re = re.compile(
-            r'(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:' + ext_part + r')\b',
+            r'(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*(?:[\w.\-]+\.(?:'
+            + env_ext_part + r'|' + ext_part + r')|\.env(?:\.[\w.\-]+)?)\b',
             re.IGNORECASE,
         )
 

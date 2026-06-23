@@ -361,6 +361,34 @@ class TestExtractMedia:
         assert "[[audio_as_voice]]" not in cleaned
         assert "[[as_document]]" not in cleaned
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/tmp/project.env",
+            "/tmp/.env",
+            "/tmp/.env.local",
+            "/tmp/project.env.production",
+        ],
+    )
+    def test_media_tag_supports_env_files(self, path):
+        content = f"MEDIA:{path}"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [(path, False)]
+        assert cleaned == ""
+
+    @pytest.mark.parametrize("filename", ["project.env", ".env", ".env.local", "project.env.production"])
+    def test_bare_local_env_path_is_detected(self, tmp_path, filename):
+        env_path = tmp_path / filename
+        env_path.write_text("TOKEN=redacted\n", encoding="utf-8")
+        media, cleaned = BasePlatformAdapter.extract_local_files(str(env_path))
+        assert media == [str(env_path)]
+        assert cleaned == ""
+
+    def test_env_is_supported_document_type(self):
+        from gateway.platforms.base import SUPPORTED_DOCUMENT_TYPES
+
+        assert SUPPORTED_DOCUMENT_TYPES[".env"] == "text/plain"
+
 
 class TestMediaDeliveryPathValidation:
     def _patch_roots(self, monkeypatch, *roots):

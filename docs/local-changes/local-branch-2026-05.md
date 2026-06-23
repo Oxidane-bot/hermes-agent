@@ -93,6 +93,32 @@ adapters, tokens, webhooks, sessions, and outbound message delivery.
 | `9ed60b33` | Local-change index discoverability | Developer-facing | README + recorded here |
 | `d813a03d` | Voice transcript prompt semantics | Yes | Recorded here |
 | `b0b6a411` | `/goal` judge completion evidence | Yes | Recorded here |
+| `fix(gateway): support env file attachments` | Telegram file delivery | Yes | README.local + recorded here |
+
+## Telegram attachment handling
+
+### `fix(gateway): support env file attachments` — Treat env files as text attachments
+
+Intent: allow `.env`-style configuration files to move through the same native attachment path as other supported text documents instead of forcing users to rename or archive them.
+
+Touched areas:
+
+- `gateway/platforms/base.py`
+- `gateway/platforms/telegram.py`
+- `gateway/run.py`
+- `tests/gateway/test_platform_base.py`
+- `tests/gateway/test_telegram_documents.py`
+
+User-visible behavior:
+
+- `MEDIA:/tmp/project.env`, `MEDIA:/tmp/.env`, `MEDIA:/tmp/.env.local`, and `MEDIA:/tmp/project.env.production` are recognized as native attachments.
+- Bare local paths for the same filename family are also detected by the local-file extraction path.
+- Inbound Telegram documents with `.env`-style names are cached as `text/plain` documents.
+
+Maintenance notes:
+
+- Tests and docs use redacted placeholder contents only; do not commit real env values.
+- Keep `.env` support limited to attachment routing. This does not make secrets safe to publish.
 
 ## Context compression and Codex Responses recovery
 

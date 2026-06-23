@@ -5489,8 +5489,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 ext = ""
                 original_filename = doc.file_name or ""
                 if original_filename:
+                    lower_filename = original_filename.lower()
                     _, ext = os.path.splitext(original_filename)
                     ext = ext.lower()
+                    if (
+                        lower_filename == ".env"
+                        or lower_filename.startswith(".env.")
+                        or ".env." in lower_filename
+                        or lower_filename.endswith(".env")
+                    ):
+                        ext = ".env"
 
                 # Normalize mime_type for robust comparisons (some clients send
                 # uppercase like "IMAGE/PNG").

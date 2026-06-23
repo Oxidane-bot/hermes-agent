@@ -19,6 +19,9 @@ This branch is Oxidane's personal maintenance branch for a public fork of NousRe
   - Registers the Telegram command menu after the adapter is connected so menu updates do not block polling startup.
   - Uses the Telegram Bot API command limit and logs hidden commands when the menu is full.
   - Rejects oversized document uploads with a clear failure instead of silently sending a local file path as text.
+- `fix: support env file attachments`
+  - Allows `MEDIA:` tags, bare local paths, and inbound Telegram documents to treat `.env`, `.env.*`, and `*.env.*` files as text attachments.
+  - Keeps secret file contents out of docs and tests; examples use redacted placeholder values only.
 
 ## Test notes
 

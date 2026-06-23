@@ -262,6 +262,25 @@ class TestDocumentDownloadBlock:
         assert event.media_urls and event.media_urls[0].endswith("archive.zip")
         assert event.media_types == ["application/zip"]
 
+    @pytest.mark.parametrize("filename", ["project.env", ".env", ".env.local", "project.env.production"])
+    @pytest.mark.asyncio
+    async def test_env_document_cached(self, adapter, filename):
+        content = b"TOKEN=redacted\n"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name=filename,
+            mime_type="text/plain",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls and event.media_urls[0].endswith(filename)
+        assert event.media_types == ["text/plain"]
+
     @pytest.mark.asyncio
     async def test_png_document_is_routed_as_image(self, adapter):
         """Telegram documents that are really PNGs should use the image path."""
