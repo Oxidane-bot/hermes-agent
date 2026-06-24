@@ -18,5 +18,6 @@ Maintenance rule:
 
 Current index:
 
+- [v0.17 Port — June 2026](./v0.17-port-2026-06.md) — local fork patches forward-ported onto upstream v0.17.0.
 - [May 2026 local fork changes](./local-branch-2026-05.md) — behavior, user-visible impact, verification, and maintenance notes for the active local deltas.
 - [Fork Branch Strategy](./branch-strategy.md) — remotes, branch cleanup policy, and how this fork keeps following upstream releases/tags.
