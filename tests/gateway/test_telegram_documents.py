@@ -51,7 +51,10 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 # Now we can safely import
-from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+from gateway.platforms.telegram import (  # noqa: E402
+    TELEGRAM_MAX_DOCUMENT_UPLOAD_BYTES,
+    TelegramAdapter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +145,10 @@ def adapter():
 
 @pytest.fixture(autouse=True)
 def _redirect_cache(tmp_path, monkeypatch):
-    """Point document/video cache to tmp_path so tests don't touch ~/.hermes."""
+    """Point media caches to tmp_path so tests don't touch ~/.hermes."""
+    monkeypatch.setattr(
+        "gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "image_cache"
+    )
     monkeypatch.setattr(
         "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
     )
@@ -259,6 +265,25 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls and event.media_urls[0].endswith("archive.zip")
         assert event.media_types == ["application/zip"]
+
+    @pytest.mark.parametrize("filename", ["project.env", ".env", ".env.local", "project.env.production"])
+    @pytest.mark.asyncio
+    async def test_env_document_cached(self, adapter, filename):
+        content = b"TOKEN=redacted\n"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name=filename,
+            mime_type="text/plain",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls and event.media_urls[0].endswith(filename)
+        assert event.media_types == ["text/plain"]
 
     @pytest.mark.asyncio
     async def test_png_document_is_routed_as_image(self, adapter):
@@ -701,6 +726,34 @@ class TestSendDocument:
 
         call_kwargs = connected_adapter._bot.send_document.call_args[1]
         assert len(call_kwargs["caption"]) == 1024
+
+    @pytest.mark.asyncio
+    async def test_send_document_too_large_returns_failure_without_path_fallback(
+        self,
+        connected_adapter,
+        tmp_path,
+    ):
+        """Oversized Telegram uploads fail loudly instead of texting a local path."""
+        test_file = tmp_path / "large.zip"
+        with open(test_file, "wb") as f:
+            f.truncate(TELEGRAM_MAX_DOCUMENT_UPLOAD_BYTES + 1)
+
+        connected_adapter._bot.send_document = AsyncMock()
+        connected_adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert "too large" in result.error.lower()
+        assert str(test_file) in result.error
+        connected_adapter._bot.send_document.assert_not_called()
+        connected_adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_document_api_error_falls_back(self, connected_adapter, tmp_path):

@@ -25,6 +25,7 @@ class TestTavilyRequest:
         """No TAVILY_API_KEY → ValueError with guidance."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TAVILY_API_KEY", None)
+            os.environ.pop("TAVILY_API_KEYS", None)
             from tools.web_tools import _tavily_request
             with pytest.raises(ValueError, match="TAVILY_API_KEY"):
                 _tavily_request("search", {"query": "test"})
@@ -46,6 +47,40 @@ class TestTavilyRequest:
                 assert payload["api_key"] == "tvly-test-key"
                 assert payload["query"] == "hello"
                 assert "api.tavily.com/search" in call_kwargs.args[0]
+
+    def test_accepts_plural_key_pool(self):
+        """TAVILY_API_KEYS should be treated as a valid multi-key source."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"results": []}
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.dict(os.environ, {"TAVILY_API_KEYS": "tvly-a,tvly-b"}):
+            with patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post:
+                from tools.web_tools import _tavily_request
+                result = _tavily_request("search", {"query": "hello"})
+
+                assert result == {"results": []}
+                assert mock_post.call_args.kwargs["json"]["api_key"] == "tvly-a"
+
+    def test_falls_through_on_quota_failure(self):
+        """A cooled key should let the next configured key handle the request."""
+        import httpx as _httpx
+
+        bad = MagicMock()
+        bad.raise_for_status.side_effect = _httpx.HTTPStatusError(
+            "401 Unauthorized", request=MagicMock(), response=bad
+        )
+        good = MagicMock()
+        good.json.return_value = {"results": [{"title": "ok"}]}
+        good.raise_for_status = MagicMock()
+
+        with patch.dict(os.environ, {"TAVILY_API_KEYS": "bad-key,good-key", "TAVILY_KEY_COOLDOWN_SECONDS": "60"}):
+            with patch("tools.web_tools.httpx.post", side_effect=[bad, good]) as mock_post:
+                from tools.web_tools import _tavily_request
+                result = _tavily_request("search", {"query": "hello"})
+
+        assert result["results"][0]["title"] == "ok"
+        assert mock_post.call_count == 2
 
     def test_raises_on_http_error(self):
         """Non-2xx responses propagate as httpx.HTTPStatusError."""
@@ -191,6 +226,23 @@ class TestWebSearchTavily:
             assert len(result["data"]["web"]) == 1
             assert result["data"]["web"][0]["title"] == "Result"
 
+    def test_search_dispatches_with_plural_keys(self):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "results": [{"title": "Result", "url": "https://r.com", "content": "desc", "score": 0.9}]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("tools.web_tools._get_backend", return_value="tavily"), \
+             patch.dict(os.environ, {"TAVILY_API_KEYS": "tvly-a,tvly-b"}), \
+             patch("tools.web_tools.httpx.post", return_value=mock_response), \
+             patch("tools.interrupt.is_interrupted", return_value=False):
+            from tools.web_tools import web_search_tool
+            result = json.loads(web_search_tool("test query", limit=3))
+            assert result["success"] is True
+            assert len(result["data"]["web"]) == 1
+            assert result["data"]["web"][0]["title"] == "Result"
+
 
 # ─── web_extract_tool (Tavily dispatch) ───────────────────────────────────────
 
@@ -224,4 +276,3 @@ class TestWebExtractTavily:
             assert "results" in result
             assert len(result["results"]) == 1
             assert result["results"][0]["url"] == "https://example.com"
-

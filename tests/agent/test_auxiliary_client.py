@@ -23,6 +23,7 @@ from agent.auxiliary_client import (
     _is_payment_error,
     _is_rate_limit_error,
     _is_model_not_found_error,
+    _is_model_unavailable_error,
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
     _try_payment_fallback,
@@ -50,6 +51,17 @@ class _FakeAnthropicStream:
 
     def get_final_message(self):
         return self._final_message
+
+
+class _AuxModelUnavailable503(Exception):
+    status_code = 503
+
+    def __init__(self, model="gemini-3.5-flash"):
+        super().__init__(
+            "Error code: 503 - {'error': {'code': 'model_not_found', "
+            f"'message': 'No available channel for model {model} under group "
+            "level3 (distributor)', 'type': 'new_api_error'}}"
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -1443,6 +1455,11 @@ class TestIsModelNotFoundError:
         exc.status_code = 500
         assert _is_model_not_found_error(exc) is False
 
+    def test_aggregator_503_no_available_channel_is_model_unavailable(self):
+        exc = _AuxModelUnavailable503()
+        assert _is_model_not_found_error(exc) is False
+        assert _is_model_unavailable_error(exc) is True
+
 
 class TestRefreshNousRecommendedModel:
     """_refresh_nous_recommended_model picks a fresh model after a stale 404."""
@@ -1741,27 +1758,26 @@ class TestAuxiliaryFallbackLayering:
             MagicMock(message=MagicMock(content="from configured chain"))
         ])
 
-        main_called = MagicMock()
+        fallback_called = MagicMock(
+            return_value=(chain_client, "gpt-4o-mini", "fallback_chain[0](openai)")
+        )
 
         with patch("agent.auxiliary_client._get_cached_client",
                    return_value=(primary_client, "glm-4v-flash")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
-             patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(chain_client, "gpt-4o-mini", "fallback_chain[0](openai)")), \
-             patch("agent.auxiliary_client._try_main_agent_model_fallback",
-                   side_effect=main_called):
+             patch("agent.auxiliary_client._try_vision_model_fallback",
+                   side_effect=fallback_called):
             result = call_llm(
                 task="vision",
                 messages=[{"role": "user", "content": "hello"}],
             )
 
         assert chain_client.chat.completions.create.called
-        # Main agent fallback should NOT have been consulted — chain succeeded first
-        main_called.assert_not_called()
+        fallback_called.assert_called_once_with("zai", reason="payment error")
 
-    def test_explicit_provider_falls_back_to_main_when_chain_exhausted(self, monkeypatch):
-        """If configured fallback_chain returns nothing, main agent model is tried next."""
+    def test_explicit_provider_falls_back_to_vision_chain_when_primary_exhausted(self, monkeypatch):
+        """Vision fallback must stay on vision-capable clients."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
         primary_client = MagicMock()
@@ -1776,9 +1792,7 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(primary_client, "glm-4v-flash")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
-             patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(None, None, "")), \
-             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+             patch("agent.auxiliary_client._try_vision_model_fallback",
                    return_value=(main_client, "claude-sonnet-4", "main-agent(openrouter)")):
             result = call_llm(
                 task="vision",
@@ -1798,9 +1812,7 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(primary_client, "glm-4v-flash")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
-             patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(None, None, "")), \
-             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+             patch("agent.auxiliary_client._try_vision_model_fallback",
                    return_value=(None, None, "")), \
              caplog.at_level("WARNING", logger="agent.auxiliary_client"):
             with pytest.raises(Exception, match="Payment Required"):
@@ -1812,6 +1824,125 @@ class TestAuxiliaryFallbackLayering:
         assert any(
             "all fallbacks exhausted" in r.message for r in caplog.records
         ), f"Expected exhaustion warning, got: {[r.message for r in caplog.records]}"
+
+
+class TestAuxiliaryVisionModelUnavailableFallback:
+    """Vision provider model-unavailable errors reroute to vision fallbacks."""
+
+    def test_call_llm_vision_model_not_found_uses_vision_fallback(self, caplog):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://x666.me/v1/"
+        primary_client.chat.completions.create.side_effect = _AuxModelUnavailable503()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://openrouter.ai/api/v1"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback vision")
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("bohe", "gemini-3.5-flash", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("bohe", primary_client, "gemini-3.5-flash"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_vision_model_fallback",
+                return_value=(fallback_client, "google/gemini-3-flash-preview", "openrouter"),
+            ) as mock_fallback,
+            caplog.at_level(logging.INFO, logger="agent.auxiliary_client"),
+        ):
+            resp = call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe image"}],
+            )
+
+        assert resp.choices[0].message.content == "fallback vision"
+        assert primary_client.chat.completions.create.call_count == 1
+        assert fallback_client.chat.completions.create.call_count == 1
+        mock_fallback.assert_called_once_with("bohe", reason="model unavailable")
+        assert any("model unavailable on bohe" in rec.getMessage() for rec in caplog.records)
+        assert any("openrouter" in rec.getMessage() for rec in caplog.records)
+
+    def test_configured_vision_fallback_chain_skips_same_named_custom_provider(self):
+        from agent.auxiliary_client import _try_configured_vision_fallback_chain
+
+        fallback_client = MagicMock()
+
+        config = {
+            "fallback_chain": [
+                {"provider": "custom:Bohe", "model": "gemini-3.5-flash"},
+                {"provider": "openrouter", "model": "google/gemini-3-flash-preview"},
+            ],
+        }
+
+        with (
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+            patch(
+                "agent.auxiliary_client._resolve_vision_fallback_entry",
+                return_value=("openrouter", fallback_client, "google/gemini-3-flash-preview"),
+            ) as mock_resolve,
+        ):
+            client, model, label = _try_configured_vision_fallback_chain(
+                "bohe", reason="model unavailable"
+            )
+
+        assert client is fallback_client
+        assert model == "google/gemini-3-flash-preview"
+        assert label == "openrouter"
+        mock_resolve.assert_called_once_with(
+            {"provider": "openrouter", "model": "google/gemini-3-flash-preview"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_vision_model_not_found_uses_vision_fallback(self, caplog):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://x666.me/v1/"
+        primary_client.chat.completions.create = AsyncMock(side_effect=_AuxModelUnavailable503())
+
+        fallback_sync_client = MagicMock()
+        fallback_sync_client.base_url = "https://openrouter.ai/api/v1"
+
+        fallback_async_client = MagicMock()
+        fallback_async_client.base_url = "https://openrouter.ai/api/v1"
+        fallback_async_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async fallback vision")
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("bohe", "gemini-3.5-flash", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("bohe", primary_client, "gemini-3.5-flash"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_vision_model_fallback",
+                return_value=(fallback_sync_client, "google/gemini-3-flash-preview", "openrouter"),
+            ) as mock_fallback,
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback_async_client, "google/gemini-3-flash-preview"),
+            ) as mock_to_async,
+            caplog.at_level(logging.INFO, logger="agent.auxiliary_client"),
+        ):
+            resp = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe image"}],
+            )
+
+        assert resp.choices[0].message.content == "async fallback vision"
+        assert primary_client.chat.completions.create.await_count == 1
+        assert fallback_async_client.chat.completions.create.await_count == 1
+        mock_fallback.assert_called_once_with("bohe", reason="model unavailable")
+        mock_to_async.assert_called_once_with(
+            fallback_sync_client, "google/gemini-3-flash-preview", is_vision=True
+        )
+        assert any("model unavailable on bohe" in rec.getMessage() for rec in caplog.records)
+        assert any("openrouter" in rec.getMessage() for rec in caplog.records)
 
 
 class TestTryMainAgentModelFallback:

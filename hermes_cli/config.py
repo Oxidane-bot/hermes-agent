@@ -2762,7 +2762,7 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
     4: ["VOICE_TOOLS_OPENAI_KEY", "ELEVENLABS_API_KEY"],
     5: ["WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS",
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
-    10: ["TAVILY_API_KEY"],
+    10: ["TAVILY_API_KEY", "TAVILY_API_KEYS"],
     11: ["TERMINAL_MODAL_MODE"],
 }
 
@@ -3237,12 +3237,21 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "TAVILY_API_KEY": {
-        "description": "Tavily API key for AI-native web search and extract",
-        "prompt": "Tavily API key",
+        "description": "Tavily API key(s) for AI-native web search, extract, and crawl; accepts comma/newline-separated keys",
+        "prompt": "Tavily API key(s)",
         "url": "https://app.tavily.com/home",
         "tools": ["web_search", "web_extract"],
         "password": True,
         "category": "tool",
+    },
+    "TAVILY_API_KEYS": {
+        "description": "Optional explicit Tavily multi-key pool; comma/newline-separated keys are tried fill-first with cooldown failover",
+        "prompt": "Tavily API keys",
+        "url": "https://app.tavily.com/home",
+        "tools": ["web_search", "web_extract", "web_crawl"],
+        "password": True,
+        "category": "tool",
+        "advanced": True,
     },
     "SEARXNG_URL": {
         "description": "URL of your SearXNG instance for free self-hosted web search",
@@ -6620,7 +6629,7 @@ def set_config_value(key: str, value: str):
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
         'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
         'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
-        'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY',
+        'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY', 'TAVILY_API_KEYS',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',

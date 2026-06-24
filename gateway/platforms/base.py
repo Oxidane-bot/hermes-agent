@@ -1088,6 +1088,13 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         if _path_is_within(resolved, resolved_root):
             return str(resolved)
 
+    # ``.env``-family files commonly contain credentials. They are accepted as
+    # inbound user uploads and may be re-delivered from Hermes caches or
+    # explicit operator allowlisted roots above, but should never be auto-sent
+    # from arbitrary host/project paths via prompt-injected MEDIA tags.
+    if is_env_document_filename(resolved.name):
+        return None
+
     # Non-strict mode (default): accept anything not on the denylist.
     # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,
     # ~/.hermes/auth.json, etc. — so the obvious prompt-injection sites
@@ -1134,6 +1141,7 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".toml": "application/toml",
     ".ini": "text/plain",
     ".cfg": "text/plain",
+    ".env": "text/plain",
     ".zip": "application/zip",
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1201,7 +1209,7 @@ MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
     # Audio (delivered as voice/audio where supported)
     ".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac",
     # Documents (uploaded as file attachments)
-    ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".epub",
+    ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".env", ".epub",
     # Spreadsheets / data
     ".xlsx", ".xls", ".ods", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     # Presentations
@@ -1220,6 +1228,23 @@ _MEDIA_EXT_ALTERNATION = "|".join(
     sorted((e.lstrip(".") for e in MEDIA_DELIVERY_EXTS), key=len, reverse=True)
 )
 
+# ``.env`` overlays need one more regex branch because the deliverable family is
+# broader than a single trailing extension: ``.env``, ``.env.*``, and
+# ``*.env.*`` should all route as text attachments.
+_MEDIA_ENV_FAMILY_ALT = r"env(?:\.[\w.-]+)?"
+_MEDIA_TAG_EXT_ALTERNATION = _MEDIA_ENV_FAMILY_ALT + "|" + _MEDIA_EXT_ALTERNATION
+
+
+def is_env_document_filename(filename: str) -> bool:
+    """Return true for .env, .env.*, *.env, and *.env.* config documents."""
+    lower_filename = (filename or "").lower()
+    return (
+        lower_filename == ".env"
+        or lower_filename.startswith(".env.")
+        or lower_filename.endswith(".env")
+        or ".env." in lower_filename
+    )
+
 # Anchored ``MEDIA:<path>`` cleanup pattern. Unlike the old loose
 # ``MEDIA:\\s*\\S+``, this only strips a tag whose path ends in a known
 # deliverable extension (optionally quoted/backticked). A ``MEDIA:`` tag with
@@ -1232,7 +1257,7 @@ _MEDIA_EXT_ALTERNATION = "|".join(
 MEDIA_TAG_CLEANUP_RE = re.compile(
     r'''[`"']?MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
-    r'''(?:~/|/|[A-Za-z]:[/\\])\S+(?:[^\S\n]+\S+)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
+    r'''(?:~/|/|[A-Za-z]:[/\\])\S+(?:[^\S\n]+\S+)*?\.(?:''' + _MEDIA_TAG_EXT_ALTERNATION + r'''))'''
     r'''(?=[\s`"',;:)\]}]|$)[`"']?''',
     re.IGNORECASE,
 )
@@ -1325,6 +1350,8 @@ class CachedMedia:
 def _resolve_media_ext(filename: str, mime_type: str) -> str:
     """Best-effort file extension from filename, then MIME fallback."""
     if filename:
+        if is_env_document_filename(filename):
+            return ".env"
         ext = os.path.splitext(filename)[1].lower()
         if ext:
             return ext
@@ -3078,13 +3105,17 @@ class BasePlatformAdapter(ABC):
         """
         _LOCAL_MEDIA_EXTS = MEDIA_DELIVERY_EXTS
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
+        env_ext_part = _MEDIA_ENV_FAMILY_ALT
 
-        # (?<![/:\w.]) prevents matching inside URLs (e.g. https://…/img.png)
+        # (?<![/:\\w.]) prevents matching inside URLs (e.g. https://…/img.png)
         #             and relative paths (./foo.png)
         # (?:~/|/)    anchors to absolute or home-relative Unix paths
         # (?:[A-Za-z]:[/\\]) anchors to Windows drive-letter paths (#34632)
+        # The final filename branch special-cases ``.env`` / ``.env.*`` because
+        # a leading-dot basename has no stem before the separator.
         path_re = re.compile(
-            r'(?<![/:\w.])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:' + ext_part + r')\b',
+            r'(?<![/:\w.])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*(?:[\w.\-]+\.(?:'
+            + env_ext_part + r'|' + ext_part + r')|\.env(?:\.[\w.\-]+)?)\b',
             re.IGNORECASE,
         )
 

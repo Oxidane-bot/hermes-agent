@@ -61,6 +61,7 @@ from plugins.web.firecrawl.provider import (
 # Tavily helpers re-exported for backward-compat with existing unit tests
 # (tests/tools/test_web_tools_tavily.py imports these names directly).
 from plugins.web.tavily.provider import (  # noqa: F401 — backward-compat names
+    _get_tavily_api_keys,
     _normalize_tavily_documents,
     _normalize_tavily_search_results,
     _tavily_request,
@@ -133,6 +134,9 @@ def _env_value(name: str) -> str:
 def _has_env(name: str) -> bool:
     return bool(_env_value(name))
 
+def _has_tavily_api_key() -> bool:
+    return bool(_get_tavily_api_keys())
+
 def _load_web_config() -> dict:
     """Load the ``web:`` section from ~/.hermes/config.yaml."""
     try:
@@ -160,7 +164,7 @@ def _get_backend() -> str:
     # with "no subscription" and the tool returns an error to the agent
     # without falling back). Free-tier backends trail the paid ones.
     backend_candidates = (
-        ("tavily", _has_env("TAVILY_API_KEY")),
+        ("tavily", _has_tavily_api_key()),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
@@ -223,7 +227,7 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "firecrawl":
         return check_firecrawl_api_key()
     if backend == "tavily":
-        return _has_env("TAVILY_API_KEY")
+        return _has_tavily_api_key()
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":

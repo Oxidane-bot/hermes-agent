@@ -594,6 +594,67 @@ class TestMediaExtensionAllowlistParity:
         assert "Here is your report:" in stripped
 
 
+class TestEnvFileAttachmentSupport:
+    """``.env`` / ``.env.*`` / ``*.env.*`` are treated as text attachments
+    in both ``extract_media`` (MEDIA: tags) and ``extract_local_files``
+    (bare local paths), and listed in SUPPORTED_DOCUMENT_TYPES."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/tmp/project.env",
+            "/tmp/.env",
+            "/tmp/.env.local",
+            "/tmp/project.env.production",
+        ],
+    )
+    def test_env_family_media_tag_extracts(self, path):
+        media, cleaned = BasePlatformAdapter.extract_media(f"MEDIA:{path}")
+        assert media == [(path, False)]
+        assert cleaned == ""
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["project.env", ".env", ".env.local", "project.env.production"],
+    )
+    def test_env_family_bare_local_path_extracts(self, tmp_path, filename):
+        env_path = tmp_path / filename
+        env_path.write_text("TOKEN=redacted\n", encoding="utf-8")
+
+        media, cleaned = BasePlatformAdapter.extract_local_files(str(env_path))
+
+        assert media == [str(env_path)]
+        assert cleaned == ""
+
+    def test_env_extension_present_in_shared_document_types(self):
+        from gateway.platforms.base import MEDIA_DELIVERY_EXTS, SUPPORTED_DOCUMENT_TYPES
+
+        assert ".env" in MEDIA_DELIVERY_EXTS
+        assert SUPPORTED_DOCUMENT_TYPES[".env"] == "text/plain"
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["project.env", ".env", ".env.local", "project.env.production"],
+    )
+    def test_env_family_resolves_in_shared_media_cache(self, tmp_path, monkeypatch, filename):
+        from gateway.platforms.base import cache_media_bytes
+
+        monkeypatch.setattr(
+            "gateway.platforms.base.DOCUMENT_CACHE_DIR",
+            tmp_path / "doc_cache",
+        )
+        cached = cache_media_bytes(
+            b"TOKEN=redacted\n",
+            filename=filename,
+            mime_type="text/plain",
+        )
+
+        assert cached is not None
+        assert cached.kind == "document"
+        assert cached.media_type == "text/plain"
+        assert cached.display_name == filename
+
+
 class TestMediaDeliveryPathValidation:
     def _patch_roots(self, monkeypatch, *roots):
         monkeypatch.setattr(
@@ -953,6 +1014,41 @@ class TestMediaDeliveryDefaultMode:
 
         out = BasePlatformAdapter.filter_local_delivery_paths([str(notes)])
         assert out == [str(notes.resolve())]
+
+    @pytest.mark.parametrize(
+        "filename",
+        [".env", ".env.local", "project.env", "project.env.production"],
+    )
+    def test_default_mode_blocks_env_family_outside_allowlist(self, tmp_path, monkeypatch, filename):
+        """Env files are credential-shaped even when they are not under
+        ~/.hermes, so default-mode path permissiveness must not auto-upload
+        them from arbitrary host/project directories.
+        """
+        self._patch_roots(monkeypatch)
+
+        env_file = tmp_path / "project" / filename
+        env_file.parent.mkdir()
+        env_file.write_text("TOKEN=sk-test\n")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(env_file)) is None
+        assert BasePlatformAdapter.filter_local_delivery_paths([str(env_file)]) == []
+
+    def test_env_family_allowed_from_operator_allowlist(self, tmp_path, monkeypatch):
+        """Operators can still opt in to delivering generated env templates
+        from an explicit media allowlist root.
+        """
+        self._patch_roots(monkeypatch)
+
+        allow_root = tmp_path / "deliverables"
+        env_file = allow_root / ".env.example"
+        env_file.parent.mkdir()
+        env_file.write_text("TOKEN=\n")
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(allow_root))
+
+        assert (
+            BasePlatformAdapter.validate_media_delivery_path(str(env_file))
+            == str(env_file.resolve())
+        )
 
     def test_root_home_deliverable_is_accepted(self, tmp_path, monkeypatch):
         """The motivating bug (#38106): a root-run gateway has ``$HOME=/root``,

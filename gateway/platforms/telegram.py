@@ -76,6 +76,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_video_from_bytes,
     cache_document_from_bytes,
+    is_env_document_filename,
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
@@ -105,8 +106,12 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".gif": "image/gif",
 }
 
+# Telegram Bot API document uploads are capped at 50 MB. Use decimal
+# megabytes to stay conservative and avoid the silent text-path fallback that
+# makes oversized artifacts look "sent" when they were not uploaded.
+TELEGRAM_MAX_DOCUMENT_UPLOAD_BYTES = 50_000_000
 
-MAX_COMMANDS_PER_SCOPE = 30
+MAX_COMMANDS_PER_SCOPE = 100
 
 
 def check_telegram_requirements() -> bool:
@@ -460,6 +465,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._polling_error_task: Optional[asyncio.Task] = None
+        self._command_menu_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
@@ -1897,6 +1903,56 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] Failed to persist thread_id to config: %s", self.name, e, exc_info=True)
 
+    async def _register_command_menu(self) -> None:
+        """Register Telegram slash-command menu without blocking adapter connect."""
+        if not self._bot:
+            return
+
+        try:
+            from telegram import (
+                BotCommand,
+                BotCommandScopeAllPrivateChats,
+                BotCommandScopeAllGroupChats,
+                BotCommandScopeDefault,
+            )
+            from hermes_cli.commands import telegram_menu_commands
+
+            menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+            bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+
+            for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
+                if not self._bot:
+                    return
+                scope_name = scope_cls.__name__
+                try:
+                    await self._bot.set_my_commands(bot_commands, scope=scope_cls())
+                    logger.info(
+                        "[%s] set_my_commands OK for scope %s (%d cmds)",
+                        self.name,
+                        scope_name,
+                        len(bot_commands),
+                    )
+                except Exception as scope_err:
+                    logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
+
+            if hidden_count:
+                logger.info(
+                    "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
+                    self.name,
+                    len(menu_commands),
+                    hidden_count,
+                    MAX_COMMANDS_PER_SCOPE,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "[%s] Could not register Telegram command menu: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+
     async def _setup_dm_topics(self) -> None:
         """Load or create configured DM topics for specified chats.
 
@@ -2215,52 +2271,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     error_callback=_polling_error_callback,
                 )
             
-            # Register bot commands so Telegram shows a hint menu when users type /
-            # List is derived from the central COMMAND_REGISTRY — adding a new
-            # gateway command there automatically adds it to the Telegram menu.
-            try:
-                from telegram import (
-                    BotCommand,
-                    BotCommandScopeAllPrivateChats,
-                    BotCommandScopeAllGroupChats,
-                    BotCommandScopeDefault,
-                )
-                from hermes_cli.commands import telegram_menu_commands
-                # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Limit to 30 core commands
-                # to stay well under the threshold while covering all categories.
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
-                # Register for all scopes independently — Telegram picks the
-                # narrowest matching scope per chat type (forum topics fall
-                # through to AllGroupChats or Default).
-                for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
-                    scope_name = scope_cls.__name__
-                    try:
-                        await self._bot.set_my_commands(bot_commands, scope=scope_cls())
-                        logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(bot_commands))
-                    except Exception as scope_err:
-                        logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
-                # Forum topics don't inherit AllGroupChats — Telegram resolves
-                # commands via BotCommandScopeChat(chat_id) for forum groups.
-                # Lazy registration happens in _ensure_forum_commands on first
-                # message from a forum topic (see _handle_text_message).
-                if hidden_count:
-                    logger.info(
-                        "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
-                        self.name, len(menu_commands), hidden_count, 30,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "[%s] Could not register Telegram command menu: %s",
-                    self.name,
-                    e,
-                    exc_info=True,
-                )
-            
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
+
+            # Register bot commands out-of-band. The platform is already able
+            # to poll and receive messages at this point; menu registration is
+            # cosmetic and can be slow/flaky on Telegram/proxy networks. Keeping
+            # it on the connect critical path makes GatewayRunner's platform
+            # timeout mark a healthy polling adapter as failed.
+            self._command_menu_task = asyncio.create_task(self._register_command_menu())
 
             # Surface the gateway as "Online" in the bot's short description
             # (opt-in via extra.status_indicator). Non-fatal.
@@ -2320,6 +2340,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        if self._command_menu_task and not self._command_menu_task.done():
+            self._command_menu_task.cancel()
+            await asyncio.gather(self._command_menu_task, return_exceptions=True)
+        self._command_menu_task = None
+
         # Mark the bot "Offline" in its short description while the bot's HTTP
         # client is still alive (before app shutdown closes it). Opt-in via
         # extra.status_indicator. Non-fatal. This is the clean-shutdown path;
@@ -4776,6 +4801,18 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
+            file_size = os.path.getsize(file_path)
+            if file_size > TELEGRAM_MAX_DOCUMENT_UPLOAD_BYTES:
+                limit_mb = TELEGRAM_MAX_DOCUMENT_UPLOAD_BYTES / 1_000_000
+                actual_mb = file_size / 1_000_000
+                return SendResult(
+                    success=False,
+                    error=(
+                        f"File is too large for Telegram bot upload "
+                        f"({actual_mb:.2f} MB > {limit_mb:.0f} MB): {file_path}"
+                    ),
+                    retryable=False,
+                )
 
             display_name = file_name or os.path.basename(file_path)
             _thread = self._metadata_thread_id(metadata)
@@ -4807,7 +4844,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            logger.warning("[%s] Failed to send document: %s", self.name, e, exc_info=True)
+            logger.warning(
+                "[%s] Failed to send Telegram document, falling back to path text: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
     async def send_video(
@@ -6311,6 +6353,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if original_filename:
                     _, ext = os.path.splitext(original_filename)
                     ext = ext.lower()
+                    if is_env_document_filename(original_filename):
+                        ext = ".env"
 
                 # Normalize mime_type for robust comparisons (some clients send
                 # uppercase like "IMAGE/PNG").

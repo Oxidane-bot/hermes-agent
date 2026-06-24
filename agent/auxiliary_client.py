@@ -2591,10 +2591,36 @@ def _is_model_not_found_error(exc: Exception) -> bool:
         "is not a valid model",
         "no such model",
         "model not found",
+        "no available channel for model",
         "the model `",            # OpenAI-style: "The model `X` does not exist"
         "model_not_found",
         "unknown model",
     ))
+
+
+def _is_model_unavailable_error(exc: Exception) -> bool:
+    """Detect provider-side model unavailability worth trying another model.
+
+    Aggregators sometimes return HTTP 503 for a model catalog miss instead of
+    a canonical 404/400. The body still carries ``model_not_found`` or
+    "No available channel for model ..."; for auxiliary vision those are
+    recoverable by switching to another vision backend.
+    """
+    if _is_model_not_found_error(exc):
+        return True
+    status = getattr(exc, "status_code", None)
+    err_lower = str(exc).lower()
+    if status in {400, 404, 503, None}:
+        return any(kw in err_lower for kw in (
+            "model_not_found",
+            "model not found",
+            "model does not exist",
+            "no such model",
+            "unknown model",
+            "is not a valid model",
+            "no available channel for model",
+        ))
+    return False
 
 
 def _evict_cached_clients(provider: str) -> None:
@@ -3132,6 +3158,77 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     )
 
 
+def _resolve_vision_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """Resolve one fallback entry as a vision backend.
+
+    This mirrors ``_resolve_fallback_entry`` but deliberately goes through
+    ``resolve_vision_provider_client`` so fallback_providers cannot route an
+    image request to a text-only main/chat client by accident.
+    """
+    provider = str(entry.get("provider") or "").strip()
+    model = str(entry.get("model") or "").strip() or None
+    if not provider:
+        return "", None, None
+    normalized = _normalize_vision_provider(provider)
+    if normalized in _PROVIDERS_WITHOUT_VISION:
+        return normalized, None, None
+    if normalized not in _VISION_AUTO_PROVIDER_ORDER and not _main_model_supports_vision(
+        normalized, _PROVIDER_VISION_MODELS.get(normalized, model)
+    ):
+        return normalized, None, None
+    base_url = str(entry.get("base_url") or "").strip() or None
+    if normalized == "zai" and "/coding/" in str(base_url or ""):
+        base_url = None
+    api_key = _fallback_entry_api_key(entry)
+    return resolve_vision_provider_client(
+        provider=provider,
+        model=_PROVIDER_VISION_MODELS.get(normalized, model),
+        base_url=base_url,
+        api_key=api_key,
+        async_mode=False,
+    )
+
+
+def _try_configured_vision_fallback_chain(
+    failed_provider: str,
+    reason: str = "model unavailable",
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Try auxiliary.vision.fallback_chain entries as vision clients."""
+    task_config = _get_auxiliary_task_config("vision")
+    chain = task_config.get("fallback_chain")
+    if not chain or not isinstance(chain, list):
+        return None, None, ""
+
+    failed_norm = _normalize_vision_provider(failed_provider)
+    tried: List[str] = []
+    for i, entry in enumerate(chain):
+        if not isinstance(entry, dict):
+            continue
+        fb_provider = str(entry.get("provider", "")).strip()
+        if not fb_provider or _normalize_vision_provider(fb_provider) == failed_norm:
+            continue
+        label = f"fallback_chain[{i}]({fb_provider})"
+        try:
+            resolved_provider, fb_client, fb_model = _resolve_vision_fallback_entry(entry)
+        except Exception as exc:
+            logger.debug("Auxiliary vision: configured fallback %s failed to resolve: %s", label, exc)
+            fb_client, fb_model, resolved_provider = None, None, ""
+        if fb_client is not None:
+            logger.info(
+                "Auxiliary vision: %s on %s — fallback target %s (%s)",
+                reason, failed_provider or "auto", label, fb_model or "default",
+            )
+            return fb_client, fb_model, resolved_provider or label
+        tried.append(label)
+
+    if tried:
+        logger.debug(
+            "Auxiliary vision: configured fallback_chain exhausted (tried: %s)",
+            ", ".join(tried),
+        )
+    return None, None, ""
+
+
 def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
@@ -3198,6 +3295,116 @@ def _try_main_fallback_chain(
             task or "call", ", ".join(tried),
         )
     return None, None, ""
+
+
+def _try_main_vision_fallback_chain(
+    failed_provider: str = "",
+    reason: str = "model unavailable",
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Try top-level fallback_providers as vision-capable backends only."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        chain = get_fallback_chain(load_config())
+    except Exception as exc:
+        logger.debug("Auxiliary vision: could not load main fallback chain: %s", exc)
+        return None, None, ""
+
+    failed_norm = _normalize_vision_provider(failed_provider)
+    main_norm = _normalize_vision_provider(_read_main_provider())
+    skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    tried: List[str] = []
+
+    for i, entry in enumerate(chain or []):
+        if not isinstance(entry, dict):
+            continue
+        fb_provider = str(entry.get("provider") or "").strip()
+        fb_model = str(entry.get("model") or "").strip()
+        if not fb_provider or not fb_model:
+            continue
+        fb_norm = _normalize_vision_provider(fb_provider)
+        label = f"fallback_providers[{i}]({fb_provider})"
+        if fb_norm in skip:
+            tried.append(f"{label} (skipped)")
+            continue
+        if _is_provider_unhealthy(fb_norm):
+            _log_skip_unhealthy(fb_norm, "vision")
+            tried.append(f"{label} (unhealthy)")
+            continue
+        try:
+            resolved_provider, fb_client, fb_resolved_model = _resolve_vision_fallback_entry(entry)
+        except Exception as exc:
+            logger.debug("Auxiliary vision: main fallback %s failed to resolve: %s", label, exc)
+            resolved_provider, fb_client, fb_resolved_model = "", None, None
+        if fb_client is not None:
+            logger.info(
+                "Auxiliary vision: %s on %s — main fallback target %s (%s)",
+                reason, failed_provider or "auto", label,
+                fb_resolved_model or fb_model,
+            )
+            return fb_client, fb_resolved_model or fb_model, resolved_provider or fb_provider
+        tried.append(label)
+
+    if tried:
+        logger.debug(
+            "Auxiliary vision: main fallback chain exhausted (tried: %s)",
+            ", ".join(tried),
+        )
+    return None, None, ""
+
+
+def _try_auto_vision_fallback(
+    failed_provider: str,
+    reason: str = "model unavailable",
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Try built-in auto vision backends, excluding the failed backend."""
+    failed_norm = _normalize_vision_provider(failed_provider)
+    main_norm = (_read_main_provider() or "").strip().lower()
+    tried: List[str] = []
+
+    for candidate in _VISION_AUTO_PROVIDER_ORDER:
+        if candidate in {failed_norm, main_norm}:
+            tried.append(f"{candidate} (skipped)")
+            continue
+        if _is_provider_unhealthy(candidate):
+            _log_skip_unhealthy(candidate, "vision")
+            tried.append(f"{candidate} (unhealthy)")
+            continue
+        sync_client, default_model = _resolve_strict_vision_backend(candidate)
+        if sync_client is not None:
+            logger.info(
+                "Auxiliary vision: %s on %s — fallback target %s (%s)",
+                reason, failed_provider or "auto", candidate,
+                default_model or "default",
+            )
+            return sync_client, default_model, candidate
+        tried.append(candidate)
+
+    logger.warning(
+        "Auxiliary vision: %s on %s and no built-in vision fallback available (tried: %s)",
+        reason, failed_provider or "auto", ", ".join(tried),
+    )
+    return None, None, ""
+
+
+def _try_vision_model_fallback(
+    failed_provider: str,
+    *,
+    reason: str = "model unavailable",
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Resolve the ordered fallback chain for a failed auxiliary vision call."""
+    fb_client, fb_model, fb_label = _try_configured_vision_fallback_chain(
+        failed_provider, reason=reason,
+    )
+    if fb_client is not None:
+        return fb_client, fb_model, fb_label
+    fb_client, fb_model, fb_label = _try_main_vision_fallback_chain(
+        failed_provider, reason=reason,
+    )
+    if fb_client is not None:
+        return fb_client, fb_model, fb_label
+    return _try_auto_vision_fallback(failed_provider, reason=reason)
 
 
 def _resolve_single_provider(
@@ -5306,6 +5513,8 @@ def call_llm(
             return _validate_llm_response(
                 client.chat.completions.create(**kwargs), task)
         except Exception as transient_err:
+            if task == "vision" and _is_model_unavailable_error(transient_err):
+                raise
             if not _is_transient_transport_error(transient_err):
                 raise
             logger.info(
@@ -5553,6 +5762,38 @@ def call_llm(
         # When the provider returns a 429 rate-limit (not billing), fall
         # back to an alternative provider instead of exhausting retries
         # against the same rate-limited endpoint.
+        vision_model_unavailable = task == "vision" and _is_model_unavailable_error(first_err)
+        if vision_model_unavailable:
+            reason = "model unavailable"
+            logger.info(
+                "Auxiliary vision: %s on %s (%s), trying fallback",
+                reason, resolved_provider, first_err,
+            )
+            fb_client, fb_model, fb_label = _try_vision_model_fallback(
+                resolved_provider or "auto", reason=reason,
+            )
+            if fb_client is not None:
+                logger.info(
+                    "Auxiliary vision: selected fallback %s (%s)",
+                    fb_label or "auto", fb_model or "default",
+                )
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                fb_base = str(getattr(fb_client, "base_url", "") or "")
+                if _is_anthropic_compat_endpoint(fb_label, fb_base):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+            logger.warning(
+                "Auxiliary vision: %s on %s and all vision fallbacks exhausted. "
+                "Raising original error.",
+                reason, resolved_provider,
+            )
+
         should_fallback = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
@@ -5591,7 +5832,10 @@ def call_llm(
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
             fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
+            if task == "vision":
+                fb_client, fb_model, fb_label = _try_vision_model_fallback(
+                    resolved_provider or "auto", reason=reason)
+            elif is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason)
                 if fb_client is None:
@@ -5792,6 +6036,8 @@ async def async_call_llm(
             return _validate_llm_response(
                 await client.chat.completions.create(**kwargs), task)
         except Exception as transient_err:
+            if task == "vision" and _is_model_unavailable_error(transient_err):
+                raise
             if not _is_transient_transport_error(transient_err):
                 raise
             logger.info(
@@ -6004,6 +6250,43 @@ async def async_call_llm(
                     else:
                         raise
 
+        vision_model_unavailable = task == "vision" and _is_model_unavailable_error(first_err)
+        if vision_model_unavailable:
+            reason = "model unavailable"
+            logger.info(
+                "Auxiliary vision (async): %s on %s (%s), trying fallback",
+                reason, resolved_provider, first_err,
+            )
+            fb_client, fb_model, fb_label = _try_vision_model_fallback(
+                resolved_provider or "auto", reason=reason,
+            )
+            if fb_client is not None:
+                logger.info(
+                    "Auxiliary vision (async): selected fallback %s (%s)",
+                    fb_label or "auto", fb_model or "default",
+                )
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                fb_base = str(getattr(fb_client, "base_url", "") or "")
+                if _is_anthropic_compat_endpoint(fb_label, fb_base):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=True
+                )
+                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                    fb_kwargs["model"] = async_fb_model
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
+            logger.warning(
+                "Auxiliary vision (async): %s on %s and all vision fallbacks exhausted. "
+                "Raising original error.",
+                reason, resolved_provider,
+            )
+
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
         should_fallback = (
             _is_payment_error(first_err)
@@ -6034,7 +6317,10 @@ async def async_call_llm(
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
             fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
+            if task == "vision":
+                fb_client, fb_model, fb_label = _try_vision_model_fallback(
+                    resolved_provider or "auto", reason=reason)
+            elif is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason)
                 if fb_client is None:

@@ -979,7 +979,7 @@ _TOOL_MEDIA_RE = re.compile(
     r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
     r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
     r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-    r'txt|csv|apk|ipa))',
+    r'txt|csv|env(?:\.[\w.-]+)?|apk|ipa))',
     re.IGNORECASE,
 )
 
@@ -7142,6 +7142,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    @staticmethod
+    def _event_has_audio_media(event: MessageEvent) -> bool:
+        """Return True when an event carries voice/audio payloads."""
+        if event.message_type in {MessageType.VOICE, MessageType.AUDIO}:
+            return True
+        media_types = getattr(event, "media_types", None) or []
+        return any(str(media_type or "").startswith("audio/") for media_type in media_types)
+
+    async def _maybe_resolve_pending_clarify(
+        self,
+        *,
+        session_key: str,
+        event: MessageEvent,
+        source,
+    ) -> bool:
+        """Resolve a pending gateway clarify from text or transcribed audio."""
+        try:
+            from tools import clarify_gateway as _clarify_mod
+        except Exception:
+            return False
+        pending_clarify = _clarify_mod.get_pending_for_session(session_key)
+        if pending_clarify is None:
+            return False
+
+        raw_reply = (event.text or "").strip()
+        if not raw_reply and self._event_has_audio_media(event):
+            try:
+                prepared_reply = await self._prepare_inbound_message_text(
+                    event=event,
+                    source=source,
+                    history=[],
+                )
+                raw_reply = (prepared_reply or "").strip()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to prepare audio clarify response for session=%s id=%s: %s",
+                    session_key,
+                    pending_clarify.clarify_id,
+                    exc,
+                    exc_info=True,
+                )
+                raw_reply = ""
+
+        # Skip slash commands — the user clearly wanted to issue a command,
+        # not answer the clarify. Leave the clarify pending so the user can
+        # retry; if it times out, the agent unblocks with an empty response.
+        if not raw_reply or raw_reply.startswith("/"):
+            return False
+
+        resolved = _clarify_mod.resolve_gateway_clarify(
+            pending_clarify.clarify_id,
+            raw_reply,
+        )
+        if resolved:
+            logger.info(
+                "Gateway intercepted clarify response (session=%s, id=%s, source=%s)",
+                session_key,
+                pending_clarify.clarify_id,
+                event.message_type.value,
+            )
+        return bool(resolved)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -7334,35 +7396,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _update_prompts.pop(_quick_key, None)
 
         # Intercept messages that are responses to a pending clarify
-        # request that is awaiting free-form text (either an open-ended
-        # clarify with no choices, or one where the user picked the
-        # "Other" button).  The first non-empty user message in the
-        # session resolves the clarify and unblocks the agent thread —
-        # we do NOT route it to the agent as a new turn.
-        try:
-            from tools import clarify_gateway as _clarify_mod
-            _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key)
-        except Exception:
-            _pending_clarify = None
-        if _pending_clarify is not None:
-            _raw_clarify_reply = (event.text or "").strip()
-            # Skip slash commands — the user clearly wanted to issue a
-            # command, not answer the clarify.  Leave the clarify pending
-            # so the user can retry; if it times out, the agent unblocks
-            # with an empty response.
-            if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_gateway_clarify(
-                    _pending_clarify.clarify_id, _raw_clarify_reply,
-                )
-                if _resolved:
-                    logger.info(
-                        "Gateway intercepted clarify text response (session=%s, id=%s)",
-                        _quick_key, _pending_clarify.clarify_id,
-                    )
-                    # Acknowledge with empty string so adapters that emit
-                    # the agent's response don't double-post.  The agent
-                    # itself will produce the next user-facing message.
-                    return ""
+        # request that is awaiting free-form input (open-ended clarify,
+        # "Other" button, or voice/audio text fallback). The first usable
+        # user message in the session resolves the clarify and unblocks the
+        # agent thread — we do NOT route it to the agent as a new turn.
+        if await self._maybe_resolve_pending_clarify(
+            session_key=_quick_key,
+            event=event,
+            source=source,
+        ):
+            # Acknowledge with empty string so adapters that emit the agent's
+            # response don't double-post. The agent itself will produce the
+            # next user-facing message.
+            return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
@@ -15535,8 +15581,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
                             r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
                             r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                            r'txt|csv|apk|ipa))',
-                            re.IGNORECASE
+                            r'txt|csv|env(?:\.[\w.-]+)?|apk|ipa))',
+                            re.IGNORECASE,
                         )
                         for _match in _TOOL_MEDIA_RE.finditer(_hc):
                             _p = _match.group(1).strip().rstrip('",}')
