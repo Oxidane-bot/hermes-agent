@@ -447,6 +447,20 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
+    def read(self, target: str) -> Dict[str, Any]:
+        """Return the current entries for target without modifying disk.
+
+        Unlike the mutating helpers, ``_success_response`` deliberately omits
+        the entries list (echoing it after a write invites thrash). ``read`` is
+        the one place the model is *meant* to see the entries, so re-attach
+        them explicitly along with the on-disk path.
+        """
+        self._reload_target(target)
+        result = self._success_response(target, "Entries read.")
+        result["entries"] = list(self._entries_for(target))
+        result["path"] = str(self._path_for(target))
+        return result
+
     def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Apply a sequence of add/replace/remove ops to one target atomically.
 
@@ -896,8 +910,11 @@ def memory_tool(
     elif action == "remove":
         result = store.remove(target, old_text)
 
+    elif action == "read":
+        result = store.read(target)
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -932,15 +949,20 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
-        "Save durable facts to persistent memory that survive across sessions. Memory is "
-        "injected into every future turn, so keep entries compact and high-signal.\n\n"
+        "Maintain compact persistent memory that survives across sessions. Memory is "
+        "injected into every future turn, so only store durable facts that materially "
+        "change future behavior. Memory is a current-state profile, not a conversation "
+        "log.\n\n"
+        "READ FIRST: before add, replace, or remove, call read for the same target in "
+        "the current turn and compare against the existing entries. Prefer replace/remove "
+        "over add; add is the last resort.\n\n"
         "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
         "{action, content?, old_text?}). The batch applies atomically and the char limit is "
         "checked only on the FINAL result — so a single call can remove/replace stale entries "
         "to free room AND add new ones, even when an add alone would overflow. The response "
         "reports current/limit chars and confirms completion; one batch call finishes the "
         "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
-        "single lone change.\n\n"
+        "single lone change or a read.\n\n"
         "WHEN: save proactively when the user states a preference, correction, or personal "
         "detail, or you learn a stable fact about their environment, conventions, or workflow. "
         "Priority: user preferences & corrections > environment facts > procedures. The best "
@@ -949,16 +971,17 @@ MEMORY_SCHEMA = {
         "removes or shortens enough stale entries and adds the new one together.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
         "notes (environment, conventions, tool quirks, lessons).\n\n"
-        "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
-        "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "DO NOT SAVE: one-off investigations, version probes, task results, completed-work "
+        "logs, debug history, schedules, temporary TODO state, project status, raw data dumps, "
+        "or procedural workflows. Use session_search for past task details; reusable procedures "
+        "belong in a skill, not memory."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read"],
                 "description": "The action to perform (single-op shape). Omit when using 'operations'."
             },
             "target": {

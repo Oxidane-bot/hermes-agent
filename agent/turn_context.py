@@ -213,6 +213,10 @@ def build_turn_context(
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
+    # Read-before-write guard is per-turn: a target read in an earlier turn
+    # must be re-read before this turn's writes, so the agent always compares
+    # against current entries rather than a stale snapshot.
+    agent._memory_read_targets_this_turn = set()
 
     # Reset the streaming context scrubber at the top of each turn.
     scrubber = getattr(agent, "_stream_context_scrubber", None)

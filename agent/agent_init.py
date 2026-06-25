@@ -1130,6 +1130,7 @@ def init_agent(
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
+    agent._memory_read_targets_this_turn = set()
     agent._iters_since_skill = 0
     if not skip_memory:
         try:

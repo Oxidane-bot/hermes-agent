@@ -643,6 +643,9 @@ class AIAgent:
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
+        # Read-before-write guard state is per-turn; clear it on session reset
+        # so a fresh session never inherits a stale "already read" target.
+        self._memory_read_targets_this_turn = set()
 
         # Context engine reset/transition (works for built-in compressor and plugins)
         self._transition_context_engine_session(
@@ -1464,6 +1467,97 @@ class AIAgent:
             task_id=task_id,
             tool_call_id=tool_call_id,
         )
+
+    def _dispatch_memory_tool(
+        self,
+        function_args: Dict[str, Any],
+        *,
+        task_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> str:
+        """Run the built-in memory tool with a read-before-write guard.
+
+        Centralizes three concerns that used to live inline at every memory
+        call site: (1) the read-before-write gate — a single-op add/replace/
+        remove is refused unless the same target was read earlier this turn;
+        (2) the per-turn nudge reset, which fires only on a *successful* read
+        or write so a blocked direct write does not count as maintenance; and
+        (3) the bridge that mirrors built-in writes to an external memory
+        provider. The batch shape (``operations``) is forwarded ungated — the
+        review prompts steer the model to read first, and the batch path is
+        all-or-nothing against the final budget.
+        """
+        target = function_args.get("target", "memory")
+        action = function_args.get("action")
+        operations = function_args.get("operations")
+        mutating_actions = {"add", "replace", "remove"}
+
+        if (
+            not operations
+            and target in {"memory", "user"}
+            and action in mutating_actions
+            and target not in getattr(self, "_memory_read_targets_this_turn", set())
+        ):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Memory writes require reading the target first in this turn. "
+                    "Call memory(action='read', target='%s') before add/replace/remove."
+                ) % target,
+                "target": target,
+                "requires_read_first": True,
+            }, ensure_ascii=False)
+
+        from tools.memory_tool import memory_tool as _memory_tool
+        result = _memory_tool(
+            action=action,
+            target=target,
+            content=function_args.get("content"),
+            old_text=function_args.get("old_text"),
+            operations=operations,
+            store=self._memory_store,
+        )
+
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            parsed = {}
+        success = bool(isinstance(parsed, dict) and parsed.get("success"))
+
+        if success and action == "read" and not operations:
+            self._memory_read_targets_this_turn.add(target)
+            self._turns_since_memory = 0
+        elif success and (operations or action in mutating_actions):
+            self._turns_since_memory = 0
+
+        # Bridge: notify external memory provider of successful built-in writes.
+        # Covers both the single-op shape and each add/replace inside a batch.
+        if self._memory_manager and success:
+            if operations:
+                _mem_ops = [
+                    op for op in operations
+                    if isinstance(op, dict) and op.get("action") in {"add", "replace"}
+                ]
+            else:
+                _mem_ops = (
+                    [{"action": action, "content": function_args.get("content")}]
+                    if action in {"add", "replace"} else []
+                )
+            for _op in _mem_ops:
+                try:
+                    self._memory_manager.on_memory_write(
+                        _op.get("action", ""),
+                        target,
+                        _op.get("content", "") or "",
+                        metadata=self._build_memory_write_metadata(
+                            task_id=task_id,
+                            tool_call_id=tool_call_id,
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        return result
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.

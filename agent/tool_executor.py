@@ -265,10 +265,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
-        # Reset nudge counters
-        if function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
+        # Reset nudge counters.
+        # Memory nudge resets inside _dispatch_memory_tool after a successful
+        # read/write; a blocked direct write should not count as maintenance.
+        if function_name == "skill_manage":
             agent._iters_since_skill = 0
 
         try:
@@ -860,9 +860,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # Tool blocked by plugin or guardrail policy — skip counters,
             # callbacks, checkpointing, activity mutation, and real execution.
             pass
-        # Reset nudge counters when the relevant tool is actually used
-        elif function_name == "memory":
-            agent._turns_since_memory = 0
+        # Reset skill nudge counter when the relevant tool is actually used.
+        # Memory nudge resets inside _dispatch_memory_tool after a successful
+        # read/write; a blocked direct write should not count as maintenance.
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
@@ -1011,44 +1011,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
         elif function_name == "memory":
             def _execute(next_args: dict) -> Any:
-                target = next_args.get("target", "memory")
-                operations = next_args.get("operations")
-                from tools.memory_tool import memory_tool as _memory_tool
-                result = _memory_tool(
-                    action=next_args.get("action"),
-                    target=target,
-                    content=next_args.get("content"),
-                    old_text=next_args.get("old_text"),
-                    operations=operations,
-                    store=agent._memory_store,
+                return agent._dispatch_memory_tool(
+                    next_args,
+                    task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", None),
                 )
-                # Bridge: notify external memory provider of built-in memory writes.
-                # Covers both the single-op shape and each add/replace inside a batch.
-                if agent._memory_manager:
-                    if operations:
-                        _mem_ops = [
-                            op for op in operations
-                            if isinstance(op, dict) and op.get("action") in {"add", "replace"}
-                        ]
-                    else:
-                        _mem_ops = (
-                            [{"action": next_args.get("action"), "content": next_args.get("content")}]
-                            if next_args.get("action") in {"add", "replace"} else []
-                        )
-                    for _op in _mem_ops:
-                        try:
-                            agent._memory_manager.on_memory_write(
-                                _op.get("action", ""),
-                                target,
-                                _op.get("content", "") or "",
-                                metadata=agent._build_memory_write_metadata(
-                                    task_id=effective_task_id,
-                                    tool_call_id=getattr(tool_call, "id", None),
-                                ),
-                            )
-                        except Exception:
-                            pass
-                return result
             function_result, function_args = _run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,

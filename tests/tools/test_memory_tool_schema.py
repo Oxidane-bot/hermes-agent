@@ -43,7 +43,9 @@ def test_memory_schema_is_well_formed():
     # single-op shape and is omitted when the batch ``operations`` array is used.
     assert params["required"] == ["target"]
     # Nested ``enum`` on property values is fine — only top-level is forbidden.
-    assert params["properties"]["action"]["enum"] == ["add", "replace", "remove"]
+    # ``read`` is a single-op-only inspection action (read-before-write gate);
+    # the batch ``operations`` shape stays mutation-only.
+    assert params["properties"]["action"]["enum"] == ["add", "replace", "remove", "read"]
     assert params["properties"]["target"]["enum"] == ["memory", "user"]
     # Batch shape is exposed and its items reuse the same actions.
     assert params["properties"]["operations"]["type"] == "array"
