@@ -19,6 +19,31 @@
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [NovitaAI](https://novita.ai) (AI-native cloud for Model API, Agent Sandbox, and GPU Cloud), [NVIDIA NIM](https://build.nvidia.com) (Nemotron), [Xiaomi MiMo](https://platform.xiaomimimo.com), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), [Hugging Face](https://huggingface.co), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
 
+## Fork notes for `Oxidane-bot/hermes-agent`
+
+This fork tracks upstream `NousResearch/hermes-agent` and keeps a small,
+reviewable patch stack on top of upstream releases for local deployment and
+reliability work. The current main-branch deltas are:
+
+- **Strict Responses schema compatibility**
+  - Sanitized tool schemas now fill missing `additionalProperties: false` on
+    nested `type: object` nodes so stricter OpenAI-compatible Responses
+    validators accept Hermes tool schemas.
+  - Explicit `additionalProperties: true` / `false` values are preserved.
+- **Primary-provider fallback preference**
+  - Model fallback attempts stay on the configured provider before escalating
+    to provider-level failover.
+- **Telegram command/document hardening**
+  - Telegram command-menu registration and document delivery behavior are more
+    defensive around startup ordering, command-count limits, and oversized
+    uploads.
+- **Environment-file attachment support**
+  - `.env`-style files are treated as text attachments in the same flows that
+    already accept other local text documents.
+
+For the maintained local patch index and branch notes, see
+[`README.local.md`](README.local.md).
+
 <table>
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>

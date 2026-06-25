@@ -71,19 +71,29 @@ def _sanitize_single_tool(tool: dict) -> dict:
     params = fn.get("parameters")
     # Missing / non-dict parameters → substitute the minimal valid shape.
     if not isinstance(params, dict):
-        fn["parameters"] = {"type": "object", "properties": {}}
+        fn["parameters"] = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
         return out
 
     fn["parameters"] = _sanitize_node(params, path=fn.get("name", "<tool>"))
     # After recursion, guarantee the top-level is an object with properties.
     top = fn["parameters"]
     if not isinstance(top, dict):
-        fn["parameters"] = {"type": "object", "properties": {}}
+        fn["parameters"] = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
     else:
         if top.get("type") != "object":
             top["type"] = "object"
         if "properties" not in top or not isinstance(top.get("properties"), dict):
             top["properties"] = {}
+        if "additionalProperties" not in top:
+            top["additionalProperties"] = False
     # Final pass: collapse nullable anyOf/oneOf unions that the recursive
     # sanitizer above leaves intact (it only handles the array-form
     # ``type: [X, "null"]``). Keep the ``nullable: true`` hint so runtime
@@ -250,6 +260,7 @@ def _sanitize_node(node: Any, path: str) -> Any:
             return {"type": node} if node != "object" else {
                 "type": "object",
                 "properties": {},
+                "additionalProperties": False,
             }
         # Any other stray string is not a schema — drop it by replacing with
         # a permissive object schema rather than propagate something the
@@ -258,7 +269,11 @@ def _sanitize_node(node: Any, path: str) -> Any:
             "schema_sanitizer[%s]: replacing non-schema string %r "
             "with empty object schema", path, node,
         )
-        return {"type": "object", "properties": {}}
+        return {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
 
     if isinstance(node, list):
         return [_sanitize_node(item, f"{path}[{i}]") for i, item in enumerate(node)]
@@ -321,6 +336,8 @@ def _sanitize_node(node: Any, path: str) -> Any:
     # llama.cpp's grammar generator can't constrain a free-form object.
     if out.get("type") == "object" and not isinstance(out.get("properties"), dict):
         out["properties"] = {}
+    if out.get("type") == "object" and "additionalProperties" not in out:
+        out["additionalProperties"] = False
 
     # Prune ``required`` entries that don't exist in properties (defense
     # against malformed MCP schemas; also caught upstream for MCP tools, but

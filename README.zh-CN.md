@@ -17,6 +17,22 @@
 
 支持任意模型——[Nous Portal](https://portal.nousresearch.com)、[OpenRouter](https://openrouter.ai)（200+ 模型）、[NVIDIA NIM](https://build.nvidia.com)（Nemotron）、[小米 MiMo](https://platform.xiaomimimo.com)、[z.ai/GLM](https://z.ai)、[Kimi/Moonshot](https://platform.moonshot.ai)、[MiniMax](https://www.minimax.io)、[Hugging Face](https://huggingface.co)、OpenAI，或自定义端点。使用 `hermes model` 即可切换——无需改代码，无锁定。
 
+## `Oxidane-bot/hermes-agent` Fork 说明
+
+这个 fork 会持续跟踪上游 `NousResearch/hermes-agent`，并在 `main` 上保留一小组可审查、可回归测试的本地运维补丁。当前和上游 `main` 的主要功能差异是：
+
+- **更严格的 Responses schema 兼容性**
+  - 在工具 schema sanitizer 中，会为缺失该字段的 `type: object` 节点补上 `additionalProperties: false`，让更严格的 OpenAI 兼容 Responses 校验器接受 Hermes 的嵌套工具参数 schema。
+  - 如果工具本来显式声明了 `additionalProperties: true` / `false`，会原样保留，不会覆盖。
+- **优先同 provider 的模型回退**
+  - `model.fallback_models` 会先尝试当前 provider 下的其他模型，再升级到 provider 级别故障转移。
+- **Telegram 命令/文档投递加固**
+  - 对启动顺序、命令数量限制和超大文档上传做了更稳健的处理。
+- **`.env` 类文件附件支持**
+  - `.env`、`.env.*`、`*.env.*` 这类文件会在现有文本附件链路里按可读文本处理。
+
+本地补丁索引和维护说明见 [`README.local.md`](README.local.md)。
+
 <table>
 <tr><td><b>真正的终端界面</b></td><td>完整的 TUI，支持多行编辑、斜杠命令自动补全、对话历史、中断重定向和流式工具输出。</td></tr>
 <tr><td><b>随你所在</b></td><td>Telegram、Discord、Slack、WhatsApp、Signal 和 CLI——全部从单个网关进程运行。语音备忘录转写、跨平台对话连续性。</td></tr>
