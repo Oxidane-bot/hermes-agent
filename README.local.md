@@ -1,70 +1,90 @@
-# Local Hermes Agent maintenance branch
+# Local Changes — v0.17 Port with Restored Features
 
-This file is the working note for the active local patch stack.
-For the maintained index and branch policy, see
-`docs/local-changes/README.md`, `docs/local-changes/local-branch-2026-05.md`,
-and `docs/local-changes/branch-strategy.md`.
+This branch contains hermes-agent v0.17 with restored custom features from the v0.15 fork.
 
 ## Base
 
-- Upstream project: NousResearch/hermes-agent
-- Active fork remote: Oxidane-bot/hermes-agent
-- Branch purpose: keep local reliability patches reviewable and testable before deployment.
+- **Upstream:** NousResearch/hermes-agent v0.17
+- **Fork remote:** Oxidane-bot/hermes-agent
+- **Branch:** `main` (promoted from `rebase/v0.17-port` on 2026-06-25)
+- **Legacy:** `main-v0.15-legacy-backup` (archived v0.15 custom branch)
 
-## Current local stack
+## Restored Features (6 total)
 
-- `fix: tighten strict Responses schema sanitization`
-  - Adds `additionalProperties: false` to sanitized `type: object` nodes when the schema omitted it.
-  - Preserves explicit `additionalProperties: true` / `false` on dynamic map-like tools.
-  - Targets stricter OpenAI-compatible Responses validators without mutating the original tool definitions.
-- `fix: inherit compression cache and reasoning settings`
-  - Preserves compression-related runtime settings across agent state changes.
-- `fix: prefer primary-provider model fallbacks`
-  - Allows `model.fallback_models` to try another model on the same configured provider before provider-level failover.
-  - Keeps provider names and endpoints config-driven.
-- `fix: harden Telegram command and document delivery`
-  - Registers the Telegram command menu after the adapter is connected so menu updates do not block polling startup.
-  - Uses the Telegram Bot API command limit and logs hidden commands when the menu is full.
-  - Rejects oversized document uploads with a clear failure instead of silently sending a local file path as text.
-- `fix: support env file attachments`
-  - Allows `MEDIA:` tags, bare local paths, and inbound Telegram documents to treat `.env`, `.env.*`, and `*.env.*` files as text attachments.
-  - Keeps secret file contents out of docs and tests; examples use redacted placeholder values only.
+During the v0.17 port, 98 custom commits were squashed to 2, losing 9 features. Six have been restored:
 
-## Functional differences from upstream main
+1. **Primary Provider Model Fallbacks** (`d90fdb23d`, `c20869394`, `279cfbb61`)
+   - Prefers same-provider model fallbacks before cross-provider failover
+   - Fixes cron auth fallback model routing
+   - Documents cron fallback provider support
 
-This fork's main branch intentionally carries a small deployment-focused patch
-stack beyond upstream `NousResearch/hermes-agent`. The active behavior deltas
-are:
+2. **Preserve Goals Across Compression** (`631e3a406`)
+   - Maintains task continuity through automatic session splits
+   - Prevents goal loss during context compaction
 
-- **Stricter Responses schema compatibility**
-  - Sanitized tool schemas now default missing object nodes to
-    `additionalProperties: false` so strict OpenAI-compatible Responses
-    validators accept nested object parameters.
-- **Primary-provider model fallback first**
-  - `model.fallback_models` stays on the configured provider before escalating
-    to provider-level failover.
-- **Telegram delivery hardening**
-  - Telegram command-menu registration and document delivery flows are more
-    defensive around startup ordering, API limits, and oversized uploads.
-- **Environment-file attachment support**
-  - `.env`-style files are treated as readable text attachments instead of
-    opaque binary blobs or silently ignored payloads.
+3. **Approval Reviewer Fallback Chain** (`63c588bdf`)
+   - Uses configured fallback chain when primary approval reviewer fails
+   - Improves approval workflow robustness
 
-Keep these deltas reviewable and small; prefer upstreaming general fixes where
-possible and document any intentional long-lived divergence here.
+4. **Telegram Working Bubble Deduplication** (`541a0bc6e`)
+   - Prevents duplicate status indicators during transient edit failures
+   - Improves Telegram UX
 
-## Verification and launch
+5. **Stale Stream Failover** (`449687de7`)
+   - Detects unresponsive streaming providers (60s chunk timeout)
+   - Auto-fails over to next provider
+   - Prevents indefinite hangs
 
-- Targeted test command for the attachment work:
-  - `python -m pytest -o 'addopts=' tests/gateway/test_platform_base.py tests/gateway/test_telegram_documents.py -q`
-- Local startup smoke for this fork:
-  - `./.venv/bin/hermes status`
+6. **Memory Read-Before-Write Guard** (`1c5d42b82`)
+   - Requires `memory(action='read', target=X)` before add/replace/remove
+   - Conservative review prompts encourage maintenance-only behavior
+   - Prevents blind overwrites
 
-## Privacy notes
+**See [docs/local-changes/restored-features.md](docs/local-changes/restored-features.md) for full details.**
 
-- Do not commit profile configs, `.env`, auth files, sessions, logs, or request dumps.
-- Keep custom provider endpoints and provider-specific slugs out of public documentation and source comments.
-- Describe fallback behavior generically as same-provider model fallback followed by provider-level failover.
+## Skipped Features (3 total)
+
+Three features evaluated but not restored:
+
+1. **fd/fdfind file search fallback** — Already present in v0.17 port
+2. **Telegram topic compression rebind** — v0.17 has superior `_sync_telegram_topic_binding`
+3. **Provider-level browser headers** — Depends on deleted AI Gateway provider
+
+## Testing
+
+All restored features verified against baseline test suite:
+- **Baseline:** ≥666 passed, 2 skipped
+- **New tests:** 20+ assertions for stale stream failover and memory read-before-write
+
+Run full suite:
+```bash
+uv sync --extra dev
+uv run pytest -q
+```
+
+## Development
+
+**Prerequisites:**
+- Python 3.11+
+- uv (package/environment manager)
+
+**Common commands:**
+```bash
+uv sync --extra dev          # Install/update dependencies
+uv run pytest -v             # Verbose test run
+uv run pytest tests/tools/   # Specific module
+```
+
+**Commit conventions:**
+- Use original commit message format when restoring features
+- Include `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` trailer
+- Preserve Oxidane-bot authorship: `git -c user.name="Oxidane-bot" -c user.email="oxidane-bot@users.noreply.github.com" commit`
+
+## Privacy
+
+- Do not commit profile configs, `.env`, auth files, sessions, logs, or request dumps
+- Keep custom provider endpoints out of public documentation
+- Describe fallback behavior generically
 
 ## License
 
