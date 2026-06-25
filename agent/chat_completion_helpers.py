@@ -1737,6 +1737,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
     last_chunk_time = {"t": time.time()}
+    # Tracks the last time a REAL data chunk (reasoning/content/tool_call /
+    # anthropic text/thinking/tool_use) arrived, as opposed to a bare SSE
+    # keep-alive frame. The stale-stream detector measures against this so a
+    # provider that keeps the socket warm with empty pings but never produces
+    # output is still classified as stale and failed over.
+    last_real_chunk_time = {"t": time.time()}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -1824,6 +1830,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
+        last_real_chunk_time["t"] = last_chunk_time["t"]
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
@@ -1899,12 +1906,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Accumulate reasoning content
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
+                last_real_chunk_time["t"] = time.time()
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
+                last_real_chunk_time["t"] = time.time()
                 content_parts.append(delta.content)
                 if not tool_calls_acc:
                     _fire_first_delta()
@@ -1961,6 +1970,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         entry["id"] = tc_delta.id
                     if tc_delta.function:
                         if tc_delta.function.name:
+                            last_real_chunk_time["t"] = time.time()
                             # Use assignment, not +=.  Function names are
                             # atomic identifiers delivered complete in the
                             # first chunk (OpenAI spec).  Some providers
@@ -1971,6 +1981,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # Vercel AI patterns) is immune to this.
                             entry["function"]["name"] = tc_delta.function.name
                         if tc_delta.function.arguments:
+                            last_real_chunk_time["t"] = time.time()
                             entry["function"]["arguments"] += tc_delta.function.arguments
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
@@ -2140,6 +2151,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Reset stale-stream timer for this attempt
         last_chunk_time["t"] = time.time()
+        last_real_chunk_time["t"] = last_chunk_time["t"]
         # Per-attempt diagnostic dict for the retry block to consume.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -2196,6 +2208,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         has_tool_use = True
                         tool_name = getattr(block, "name", None)
                         if tool_name:
+                            last_real_chunk_time["t"] = time.time()
                             _fire_first_delta()
                             agent._fire_tool_gen_started(tool_name)
 
@@ -2206,12 +2219,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if delta_type == "text_delta":
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
+                                last_real_chunk_time["t"] = time.time()
                                 _fire_first_delta()
                                 agent._fire_stream_delta(text)
                                 deltas_were_sent["yes"] = True
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
+                                last_real_chunk_time["t"] = time.time()
                                 _fire_first_delta()
                                 agent._fire_reasoning_delta(thinking_text)
 
@@ -2549,7 +2564,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _hb_now = time.time()
         if _hb_now - _last_heartbeat >= _HEARTBEAT_INTERVAL:
             _last_heartbeat = _hb_now
-            _waiting_secs = int(_hb_now - last_chunk_time["t"])
+            _waiting_secs = int(_hb_now - last_real_chunk_time["t"])
             agent._touch_activity(
                 f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
             )
@@ -2557,7 +2572,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Detect stale streams: connections kept alive by SSE pings
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
-        _stale_elapsed = time.time() - last_chunk_time["t"]
+        _stale_elapsed = time.time() - last_real_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
@@ -2582,12 +2597,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
             except Exception:
                 pass
-            # Reset the timer so we don't kill repeatedly while
-            # the inner thread processes the closure.
-            last_chunk_time["t"] = time.time()
+            # Surface the stale stream to the main retry/fallback loop
+            # immediately. Previously this only reset the timer and kept
+            # waiting for the worker thread; when a provider ignored the
+            # closed connection, long clean-room runs could hang until an
+            # external timeout killed Hermes instead of trying fallback.
+            if result["error"] is None and result["response"] is None:
+                result["error"] = TimeoutError(
+                    f"Streaming API call timed out after {int(_stale_elapsed)}s "
+                    f"with no chunks (threshold: {int(_stream_stale_timeout)}s)"
+                )
             agent._touch_activity(
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
             )
+            break
 
         if agent._interrupt_requested:
             # Mark THIS request cancelled before force-closing so the worker's

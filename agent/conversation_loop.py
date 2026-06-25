@@ -2261,6 +2261,25 @@ def run_conversation(
                 if recovered_with_pool:
                     continue
 
+                # Clean-room / long-running automation can otherwise spend
+                # many minutes retrying the same silent upstream stall before
+                # the configured fallback chain is even attempted.  The
+                # stale-call detector raises this exact TimeoutError after
+                # forcibly closing a no-chunk/no-response request; treat it
+                # as a failover trigger, not as ordinary backoff.
+                is_stale_api_timeout = (
+                    classified.reason == FailoverReason.timeout
+                    and isinstance(api_error, TimeoutError)
+                    and "api call timed out" in str(api_error).lower()
+                )
+                if is_stale_api_timeout and agent._has_pending_fallback():
+                    agent._buffer_status("⚠️ Provider stalled with no response — switching to fallback provider...")
+                    if agent._try_activate_fallback(reason=classified.reason):
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
+
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
                 # per-image 5 MB ceiling (400 with "image exceeds 5 MB
