@@ -9199,6 +9199,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # and searchable via session_search.
                                     _hyg_new_sid = _hyg_agent.session_id
                                     if _hyg_new_sid != session_entry.session_id:
+                                        _hyg_old_sid = session_entry.session_id
+                                        try:
+                                            from hermes_cli.goals import migrate_goal_session
+
+                                            migrate_goal_session(_hyg_old_sid, _hyg_new_sid)
+                                        except Exception:
+                                            logger.debug(
+                                                "Failed to migrate /goal state across hygiene compression split %s -> %s",
+                                                _hyg_old_sid,
+                                                _hyg_new_sid,
+                                                exc_info=True,
+                                            )
                                         session_entry.session_id = _hyg_new_sid
                                         self.session_store._save()
                                         self._sync_telegram_topic_binding(
@@ -9562,7 +9574,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
-                session_entry.session_id = agent_result["session_id"]
+                old_session_id = session_entry.session_id
+                new_session_id = agent_result["session_id"]
+                try:
+                    from hermes_cli.goals import migrate_goal_session
+
+                    migrate_goal_session(old_session_id, new_session_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to migrate /goal state across session split %s -> %s",
+                        old_session_id,
+                        new_session_id,
+                        exc_info=True,
+                    )
+                session_entry.session_id = new_session_id
                 self.session_store._save()
                 self._sync_telegram_topic_binding(
                     source, session_entry, reason="agent-result-compression",
@@ -15874,6 +15899,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 entry = self.session_store._entries.get(session_key)
                 if entry:
+                    try:
+                        from hermes_cli.goals import migrate_goal_session
+
+                        migrate_goal_session(session_id, agent_session_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to migrate /goal state across session split %s -> %s",
+                            session_id,
+                            agent_session_id,
+                            exc_info=True,
+                        )
                     entry.session_id = agent_session_id
                     self.session_store._save()
 
