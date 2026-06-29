@@ -10,6 +10,7 @@ This module is the single source of truth for the dangerous command system:
 
 import contextvars
 import fnmatch
+import json
 import logging
 import os
 import re
@@ -43,6 +44,10 @@ _approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
+    default="",
+)
+_approval_recent_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_recent_context",
     default="",
 )
 
@@ -104,6 +109,21 @@ def reset_current_observability_context(
     turn_token, tool_token = tokens
     _approval_tool_call_id.reset(tool_token)
     _approval_turn_id.reset(turn_token)
+
+
+def set_current_approval_context(context: str) -> contextvars.Token[str]:
+    """Bind a compact, redacted recent-session context for smart approval."""
+    return _approval_recent_context.set(context or "")
+
+
+def reset_current_approval_context(token: contextvars.Token[str]) -> None:
+    """Restore the previous smart-approval context."""
+    _approval_recent_context.reset(token)
+
+
+def get_current_approval_context(default: str = "") -> str:
+    """Return the compact context visible to the smart-approval reviewer."""
+    return _approval_recent_context.get() or default
 
 
 def get_current_session_key(default: str = "default") -> str:
@@ -1073,6 +1093,228 @@ def _get_approval_timeout() -> int:
         return 60
 
 
+_SMART_CONTEXT_DEFAULTS = {
+    "enabled": True,
+    "max_context_chars": 6000,
+    "recent_user_messages": 3,
+    "recent_assistant_messages": 2,
+}
+
+
+def _smart_context_config() -> dict:
+    """Return smart-approval context config with safe defaults."""
+    cfg = _get_approval_config().get("smart_context", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    merged = dict(_SMART_CONTEXT_DEFAULTS)
+    merged.update(cfg)
+    try:
+        merged["max_context_chars"] = max(0, int(merged.get("max_context_chars", 6000)))
+    except (TypeError, ValueError):
+        merged["max_context_chars"] = 6000
+    try:
+        merged["recent_user_messages"] = max(0, int(merged.get("recent_user_messages", 3)))
+    except (TypeError, ValueError):
+        merged["recent_user_messages"] = 3
+    try:
+        merged["recent_assistant_messages"] = max(0, int(merged.get("recent_assistant_messages", 2)))
+    except (TypeError, ValueError):
+        merged["recent_assistant_messages"] = 2
+    merged["enabled"] = bool(merged.get("enabled", True))
+    return merged
+
+
+def _approval_content_to_text(content) -> str:
+    """Render a message content value as compact text for approval context."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type in {"text", "input_text"} and item.get("text"):
+                    parts.append(str(item.get("text")))
+                elif item_type in {"image_url", "input_image"}:
+                    parts.append("[image attachment]")
+                elif item_type in {"audio", "input_audio"}:
+                    parts.append("[audio attachment]")
+            elif item:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    try:
+        return json.dumps(content, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(content)
+
+
+def _strip_approval_internal_notes(text: str) -> str:
+    """Drop gateway-internal notes that are not user authorization evidence."""
+    text = text or ""
+    # Voice/STT wrappers intentionally remain; they are the user's actual words.
+    internal_prefixes = (
+        "[System note:",
+        "[USER INITIATED SKILLS RELOAD:",
+        "[IMPORTANT: The ",
+    )
+    changed = True
+    while changed:
+        changed = False
+        stripped = text.lstrip()
+        for prefix in internal_prefixes:
+            if stripped.startswith(prefix):
+                end = stripped.find("]")
+                if end >= 0:
+                    stripped = stripped[end + 1:].lstrip("\n ")
+                    text = stripped
+                    changed = True
+                    break
+    return text.strip()
+
+
+def _clip_approval_text(text: str, limit: int = 1200) -> str:
+    from agent.redact import redact_sensitive_text
+
+    text = _strip_approval_internal_notes(_approval_content_to_text(text))
+    text = redact_sensitive_text(text, force=True)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 22)].rstrip() + " …[truncated]"
+
+
+def _extract_user_target_hints(user_texts: list[str], *, max_hints: int = 20) -> list[str]:
+    """Extract IPs, hostnames, obvious paths, and service names from user text."""
+    hints: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = (value or "").strip("`'\".,;:()[]{}")
+        if not value or value in seen:
+            return
+        seen.add(value)
+        hints.append(value)
+
+    ip_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    host_re = re.compile(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+\b")
+    path_re = re.compile(r"(?<![\w:])(?:~|/|\./|\.\./)[A-Za-z0-9._~+@%:=,/-]{2,}")
+    service_re = re.compile(r"\b[a-zA-Z0-9_.@-]+\.service\b")
+    profile_re = re.compile(r"\b(?:profile|配置|服务)[:：= ]+([a-zA-Z0-9_.@-]{2,})")
+
+    for raw in user_texts:
+        text = raw or ""
+        for match in ip_re.finditer(text):
+            parts = match.group(0).split(".")
+            try:
+                if all(0 <= int(part) <= 255 for part in parts):
+                    add(match.group(0))
+            except ValueError:
+                pass
+        for regex in (host_re, path_re, service_re):
+            for match in regex.finditer(text):
+                add(match.group(0))
+        for match in profile_re.finditer(text):
+            add(match.group(1))
+        if len(hints) >= max_hints:
+            return hints[:max_hints]
+    return hints[:max_hints]
+
+
+def build_recent_approval_context(
+    messages: list[dict],
+    *,
+    current_user_message=None,
+    max_context_chars: Optional[int] = None,
+    recent_user_messages: Optional[int] = None,
+    recent_assistant_messages: Optional[int] = None,
+) -> str:
+    """Build deterministic recent context for the smart-approval reviewer.
+
+    The context favors recent user-authored requests. If a gateway voice note
+    was transcribed, the normal STT wrapper is preserved so the reviewer sees
+    both that it was speech input and the actual transcribed words.
+    """
+    cfg = _smart_context_config()
+    if not cfg.get("enabled", True):
+        return ""
+    max_context_chars = cfg["max_context_chars"] if max_context_chars is None else max_context_chars
+    recent_user_messages = cfg["recent_user_messages"] if recent_user_messages is None else recent_user_messages
+    recent_assistant_messages = cfg["recent_assistant_messages"] if recent_assistant_messages is None else recent_assistant_messages
+    if max_context_chars <= 0:
+        return ""
+
+    history = list(messages or [])
+    if current_user_message is not None:
+        history.append({"role": "user", "content": current_user_message})
+
+    user_items: list[str] = []
+    assistant_items: list[str] = []
+    for msg in reversed(history):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "user" and len(user_items) < recent_user_messages:
+            clipped = _clip_approval_text(msg.get("content"), 1400)
+            if clipped:
+                user_items.append(clipped)
+        elif role == "assistant" and len(assistant_items) < recent_assistant_messages:
+            # Skip tool-call-only assistant turns; they are not intent summaries.
+            if msg.get("tool_calls") and not msg.get("content"):
+                continue
+            clipped = _clip_approval_text(msg.get("content"), 900)
+            if clipped:
+                assistant_items.append(clipped)
+        if len(user_items) >= recent_user_messages and len(assistant_items) >= recent_assistant_messages:
+            break
+
+    user_items = list(reversed(user_items))
+    assistant_items = list(reversed(assistant_items))
+    if not user_items and not assistant_items:
+        return ""
+
+    lines = [
+        "Recent conversation context for smart approval (deterministically clipped; voice inputs keep their speech-to-text wrapper):"
+    ]
+    if user_items:
+        lines.append("Recent user requests / authorizations:")
+        for idx, text in enumerate(user_items, 1):
+            lines.append(f"{idx}. {text}")
+        hints = _extract_user_target_hints(user_items)
+        if hints:
+            lines.append("User-provided target hints: " + ", ".join(hints))
+    if assistant_items:
+        lines.append("Recent assistant plan/intent excerpts:")
+        for idx, text in enumerate(assistant_items, 1):
+            lines.append(f"{idx}. {text}")
+
+    context = "\n".join(lines).strip()
+    if len(context) > max_context_chars:
+        context = context[: max(0, max_context_chars - 22)].rstrip() + " …[truncated]"
+    return context
+
+
+def _parse_smart_approval_answer(answer: str) -> str:
+    """Parse reviewer output into approve/deny/escalate, fail-closed."""
+    raw = (answer or "").strip()
+    if not raw:
+        return "escalate"
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            value = str(data.get("outcome") or data.get("decision") or data.get("verdict") or "").strip().lower()
+            if value in {"approve", "deny", "escalate"}:
+                return value
+    except Exception:
+        pass
+
+    match = re.search(r"\b(APPROVE|DENY|ESCALATE)\b", raw.upper())
+    if not match:
+        return "escalate"
+    return match.group(1).lower()
+
+
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
@@ -1143,25 +1385,48 @@ def _smart_approve(command: str, description: str) -> str:
     Returns 'approve' if the LLM determines the command is safe,
     'deny' if genuinely dangerous, or 'escalate' if uncertain.
 
-    Inspired by OpenAI Codex's Smart Approvals guardian subagent
-    (openai/codex#13860).
+    The reviewer sees both the objective command risk and a compact slice of
+    recent user-authored context.  The context is evidence of authorization,
+    not a bypass: high-risk actions still require the command target/scope to
+    match what the user asked for.
     """
     try:
         from agent.auxiliary_client import call_llm
+        from agent.redact import redact_sensitive_text
+
+        safe_command = redact_sensitive_text(command, force=True)
+        safe_description = redact_sensitive_text(description, force=True)
+        recent_context = get_current_approval_context("").strip()
+        if recent_context:
+            context_block = f"""
+Recent user/task context (redacted and clipped; may include voice-to-text wrappers):
+{recent_context}
+"""
+        else:
+            context_block = "\nRecent user/task context: unavailable. Do not infer authorization from missing context.\n"
 
         prompt = f"""You are a security reviewer for an AI coding agent. A terminal command was flagged by pattern matching as potentially dangerous.
 
-Command: {command}
-Flagged reason: {description}
+Command:
+{safe_command}
 
-Assess the ACTUAL risk of this command. Many flagged commands are false positives — for example, `python -c "print('hello')"` is flagged as "script execution via -c flag" but is completely harmless.
+Flagged reason:
+{safe_description}
+{context_block}
+Assess TWO SEPARATE AXES:
+1. risk_level: the objective command risk if executed exactly as written.
+2. user_authorization: whether recent user messages explicitly asked for this action, target, and scope.
 
 Rules:
-- APPROVE if the command is clearly safe (benign script execution, safe file operations, development tools, package installs, git operations, etc.)
-- DENY if the command could genuinely damage the system (recursive delete of important paths, overwriting system files, fork bombs, wiping disks, dropping databases, etc.)
-- ESCALATE if you're uncertain
+- APPROVE only when risk is low/medium OR when a higher-risk action is tightly scoped to an explicit recent user request and target.
+- DENY when the command is destructive, credential-exfiltrating, persistence-creating, a fork bomb, disk wipe, root/system wipe, or remote script pipe to shell without explicit target/scope.
+- ESCALATE when authorization, target trust, or blast radius is uncertain.
+- User context may justify ssh/curl/systemd/deploy actions only if the same target/scope appears in recent user requests.
+- Missing context is not authorization.
+- Do not let assistant plans alone authorize risky actions; user requests are the primary signal.
 
-Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
+Respond with strict JSON only:
+{{"risk_level":"low|medium|high|critical","user_authorization":"none|weak|partial|strong|explicit","target_trust":"unknown|observed|user_provided|configured_trusted","outcome":"approve|deny|escalate","rationale":"short reason"}}"""
 
         last_error: Optional[Exception] = None
         for provider, model in _smart_approval_attempts():
@@ -1172,7 +1437,7 @@ Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
-                    max_tokens=16,
+                    max_tokens=160,
                 )
             except Exception as e:
                 last_error = e
@@ -1184,13 +1449,8 @@ Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
                 )
                 continue
 
-            answer = (response.choices[0].message.content or "").strip().upper()
-            if "APPROVE" in answer:
-                return "approve"
-            elif "DENY" in answer:
-                return "deny"
-            else:
-                return "escalate"
+            answer = response.choices[0].message.content or ""
+            return _parse_smart_approval_answer(answer)
 
         logger.debug("Smart approvals: all reviewer calls failed (%s), escalating", last_error)
         return "escalate"

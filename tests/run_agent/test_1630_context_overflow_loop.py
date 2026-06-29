@@ -8,8 +8,48 @@ Verifies that:
 3. Context-overflow failures produce helpful error messages suggesting /compact.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+
+
+
+class TestCompressionProgressPredicate:
+    def test_same_message_count_with_material_token_savings_is_progress(self):
+        from agent.conversation_loop import _compression_made_progress
+
+        agent = SimpleNamespace(
+            context_compressor=SimpleNamespace(
+                threshold_tokens=120_000,
+                _last_compression_savings_pct=0,
+            )
+        )
+
+        assert _compression_made_progress(
+            agent,
+            original_len=38,
+            new_len=38,
+            before_request_tokens=148_535,
+            after_request_tokens=109_618,
+        ) is True
+
+    def test_same_message_count_without_token_savings_is_not_progress(self):
+        from agent.conversation_loop import _compression_made_progress
+
+        agent = SimpleNamespace(
+            context_compressor=SimpleNamespace(
+                threshold_tokens=120_000,
+                _last_compression_savings_pct=0,
+            )
+        )
+
+        assert _compression_made_progress(
+            agent,
+            original_len=38,
+            new_len=38,
+            before_request_tokens=148_535,
+            after_request_tokens=148_200,
+        ) is False
 
 # ---------------------------------------------------------------------------
 # Test 1: Agent heuristic — generic 400 with large session → compression

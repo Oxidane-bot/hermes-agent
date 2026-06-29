@@ -71,6 +71,67 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _estimate_request_tokens_for_progress(agent: Any, messages: List[Dict[str, Any]], system_prompt: Optional[str]) -> int:
+    """Best-effort rough request estimate used only for compression progress.
+
+    The overflow-recovery path must not decide success solely from message
+    count: compression can rewrite or merge content without reducing the
+    number of chat rows.  Re-estimating the full request (system prompt +
+    tools + messages) gives the caller a stable token-savings signal.
+    """
+    try:
+        return int(estimate_request_tokens_rough(
+            messages,
+            system_prompt=system_prompt or "",
+            tools=getattr(agent, "tools", None) or None,
+        ))
+    except Exception:
+        return 0
+
+
+def _compression_made_progress(
+    agent: Any,
+    *,
+    original_len: int,
+    new_len: int,
+    before_request_tokens: int = 0,
+    after_request_tokens: int = 0,
+    context_length_changed: bool = False,
+) -> bool:
+    """Return True when a compression attempt made meaningful progress.
+
+    Historically the retry path only checked ``new_len < original_len``.
+    That misclassified successful compactions where the compressor preserved
+    message count but shortened/merged content, causing the gateway to reset
+    an otherwise recoverable session.  Treat token savings as progress too.
+    """
+    if new_len < original_len:
+        return True
+    if context_length_changed:
+        return True
+
+    if before_request_tokens > 0 and after_request_tokens > 0 and after_request_tokens < before_request_tokens:
+        compressor = getattr(agent, "context_compressor", None)
+        threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
+        if threshold_tokens > 0 and after_request_tokens <= threshold_tokens:
+            return True
+
+        saved = before_request_tokens - after_request_tokens
+        # Require a material drop so a one-token estimate wobble does not spin
+        # retries forever; max_compression_attempts remains the outer guard.
+        material_drop = max(512, int(before_request_tokens * 0.03))
+        if saved >= material_drop:
+            return True
+
+    # Built-in compressors also expose their own message-body savings metric.
+    # This catches plugin/estimate-skew cases without trusting tiny changes.
+    try:
+        savings_pct = float(getattr(getattr(agent, "context_compressor", None), "_last_compression_savings_pct", 0) or 0)
+    except Exception:
+        savings_pct = 0.0
+    return savings_pct >= 10.0
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -2756,6 +2817,9 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
+                        before_request_tokens = _estimate_request_tokens_for_progress(
+                            agent, messages, active_system_prompt,
+                        )
                         messages, active_system_prompt = agent._compress_context(
                             messages, system_message,
                             approx_tokens=approx_tokens,
@@ -2765,7 +2829,17 @@ def run_conversation(
                         # so _flush_messages_to_session_db writes compressed
                         # messages to the new session, not skipping them.
                         conversation_history = None
-                        if len(messages) < original_len or old_ctx > _reduced_ctx:
+                        after_request_tokens = _estimate_request_tokens_for_progress(
+                            agent, messages, active_system_prompt,
+                        )
+                        if _compression_made_progress(
+                            agent,
+                            original_len=original_len,
+                            new_len=len(messages),
+                            before_request_tokens=before_request_tokens,
+                            after_request_tokens=after_request_tokens,
+                            context_length_changed=old_ctx > _reduced_ctx,
+                        ):
                             agent._buffer_status(
                                 f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
                                 f"(was {old_ctx:,}), retrying..."
@@ -2933,6 +3007,9 @@ def run_conversation(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
+                    before_request_tokens = _estimate_request_tokens_for_progress(
+                        agent, messages, active_system_prompt,
+                    )
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
@@ -2941,9 +3018,24 @@ def run_conversation(
                     # so _flush_messages_to_session_db writes compressed
                     # messages to the new session, not skipping them.
                     conversation_history = None
+                    after_request_tokens = _estimate_request_tokens_for_progress(
+                        agent, messages, active_system_prompt,
+                    )
 
-                    if len(messages) < original_len:
-                        agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                    if _compression_made_progress(
+                        agent,
+                        original_len=original_len,
+                        new_len=len(messages),
+                        before_request_tokens=before_request_tokens,
+                        after_request_tokens=after_request_tokens,
+                    ):
+                        if len(messages) < original_len:
+                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                        else:
+                            agent._buffer_status(
+                                f"🗜️ Compressed context by token estimate "
+                                f"(~{before_request_tokens:,} → ~{after_request_tokens:,}), retrying..."
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -3089,6 +3181,9 @@ def run_conversation(
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                     original_len = len(messages)
+                    before_request_tokens = _estimate_request_tokens_for_progress(
+                        agent, messages, active_system_prompt,
+                    )
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
@@ -3097,10 +3192,25 @@ def run_conversation(
                     # so _flush_messages_to_session_db writes compressed
                     # messages to the new session, not skipping them.
                     conversation_history = None
+                    after_request_tokens = _estimate_request_tokens_for_progress(
+                        agent, messages, active_system_prompt,
+                    )
 
-                    if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
+                    if _compression_made_progress(
+                        agent,
+                        original_len=original_len,
+                        new_len=len(messages),
+                        before_request_tokens=before_request_tokens,
+                        after_request_tokens=after_request_tokens,
+                        context_length_changed=bool(new_ctx and new_ctx < old_ctx),
+                    ):
                         if len(messages) < original_len:
                             agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                        else:
+                            agent._buffer_status(
+                                f"🗜️ Compressed context by token estimate "
+                                f"(~{before_request_tokens:,} → ~{after_request_tokens:,}), retrying..."
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break

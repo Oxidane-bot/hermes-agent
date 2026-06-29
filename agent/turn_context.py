@@ -259,6 +259,24 @@ def build_turn_context(
 
     active_system_prompt = agent._cached_system_prompt
 
+    # Bind a compact, redacted view of recent user intent for smart approval.
+    # The terminal approval guard may run inside tool worker threads;
+    # tools.thread_context copies ContextVars into those threads, so binding
+    # here gives the reviewer the same recent user/task context throughout
+    # the turn. Voice messages have already been converted to the normal
+    # STT wrapper before run_conversation(), so the approval model sees the
+    # actual transcribed words instead of a bare audio-file placeholder.
+    try:
+        from tools.approval import (
+            build_recent_approval_context,
+            set_current_approval_context,
+        )
+
+        _approval_ctx = build_recent_approval_context(messages)
+        set_current_approval_context(_approval_ctx)
+    except Exception:
+        logger.debug("smart approval context binding skipped", exc_info=True)
+
     # Crash-resilience: persist the inbound user turn as soon as the session row exists.
     try:
         agent._persist_session(messages, conversation_history)
@@ -317,11 +335,17 @@ def build_turn_context(
             )
             for _pass in range(3):
                 _orig_len = len(messages)
+                _before_tokens = _preflight_tokens
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
-                if len(messages) >= _orig_len:
+                _after_tokens = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+                if len(messages) >= _orig_len and _after_tokens >= _before_tokens:
                     break  # Cannot compress further
                 conversation_history = None
                 agent._empty_content_retries = 0
@@ -329,11 +353,7 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                _preflight_tokens = estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
-                )
+                _preflight_tokens = _after_tokens
                 if not _compressor.should_compress(_preflight_tokens):
                     break
 

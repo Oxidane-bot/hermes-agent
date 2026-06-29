@@ -12,12 +12,16 @@ import tools.approval as approval_module
 from hermes_constants import get_hermes_home
 from tools.approval import (
     _get_approval_mode,
+    _parse_smart_approval_answer,
     _smart_approve,
+    build_recent_approval_context,
     approve_session,
     detect_dangerous_command,
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
+    reset_current_approval_context,
+    set_current_approval_context,
 )
 
 
@@ -46,7 +50,10 @@ class TestSmartApproval:
         mock_call.assert_called_once()
         assert mock_call.call_args.kwargs["task"] == "approval"
         assert mock_call.call_args.kwargs["temperature"] == 0
-        assert mock_call.call_args.kwargs["max_tokens"] == 16
+        assert mock_call.call_args.kwargs["max_tokens"] == 160
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "strict JSON" in prompt
+        assert "risk_level" in prompt
 
     def test_smart_approval_tries_configured_fallback_model(self):
         response = SimpleNamespace(
@@ -77,6 +84,64 @@ class TestSmartApproval:
         assert mock_call.call_args_list[0].kwargs["model"] == "gpt-5.5"
         assert mock_call.call_args_list[1].kwargs["provider"] == "custom:test-provider"
         assert mock_call.call_args_list[1].kwargs["model"] == "gpt-5.4"
+
+
+    def test_smart_approval_prompt_includes_recent_user_context(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"risk_level":"high","user_authorization":"explicit","target_trust":"user_provided","outcome":"approve","rationale":"user asked for this host"}'
+            ))]
+        )
+        context = (
+            "Recent user requests / authorizations:\n"
+            "1. 用户要求 SSH 到 203.0.113.7 检查 hermes.service 并重启 profile alpha"
+        )
+
+        token = set_current_approval_context(context)
+        try:
+            with (
+                mock_patch("hermes_cli.config.load_config", return_value={}),
+                mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call,
+            ):
+                result = _smart_approve(
+                    "ssh oxidane@203.0.113.7 'systemctl status hermes.service'",
+                    "ssh remote operation",
+                )
+        finally:
+            reset_current_approval_context(token)
+
+        assert result == "approve"
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "203.0.113.7" in prompt
+        assert "hermes.service" in prompt
+        assert "user_authorization" in prompt
+
+    def test_recent_approval_context_preserves_voice_transcript_text(self):
+        messages = [
+            {"role": "user", "content": "先看看日志"},
+            {"role": "assistant", "content": "我会先检查日志。"},
+            {
+                "role": "user",
+                "content": (
+                    '[The user sent a voice message~ Here\'s what they said: '
+                    '"SSH 到 203.0.113.7 检查 systemd，并且可以重启 hermes-profile.service" ]'
+                ),
+            },
+        ]
+
+        with mock_patch("hermes_cli.config.load_config", return_value={}):
+            context = build_recent_approval_context(messages, max_context_chars=2000)
+
+        assert "voice message" in context
+        assert "SSH 到 203.0.113.7" in context
+        assert "hermes-profile.service" in context
+        assert "User-provided target hints" in context
+
+    def test_smart_approval_answer_parser_prefers_json_outcome(self):
+        answer = '{"outcome":"deny","rationale":"contains word APPROVE in explanation"}'
+
+        assert _parse_smart_approval_answer(answer) == "deny"
+        assert _parse_smart_approval_answer("APPROVE") == "approve"
 
     def test_smart_approval_escalates_after_configured_models_fail(self):
         config = {
