@@ -14590,23 +14590,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _progress_adapter = self.adapters.get(source.platform)
             except Exception:
                 _progress_adapter = None
+
+            _terminal_short_preview = None
+            _terminal_code_blocks = False
             if (
-                getattr(_progress_adapter, "supports_code_blocks", False)
+                _progress_adapter is not None
                 and tool_name == "terminal"
                 and isinstance(args, dict)
                 and isinstance(args.get("command"), str)
                 and args["command"].strip()
             ):
                 from agent.display import get_tool_preview_max_len
+
                 _cmd_full = args["command"].rstrip()
-                # Consecutive terminal calls: drop the repeated
-                # "💻 terminal" header so back-to-back commands render as
-                # adjacent code blocks under a single header.
-                _block_header = (
-                    "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
-                )
-                _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
-                # Single-line, capped preview for non-verbose modes.
+                # Compute a compact single-line preview for the terminal command
+                # regardless of whether we later render it as a fenced block.
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
                 _lines = _cmd_full.splitlines()
@@ -14616,7 +14614,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_short = _cmd_short[:_cap - 3] + "..."
                 elif _multiline:
                     _cmd_short = _cmd_short + " ..."
-                _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+                _terminal_short_preview = f"{emoji} {tool_name}: \"{_cmd_short}\""
+
+                _terminal_code_blocks = getattr(
+                    _progress_adapter,
+                    "tool_progress_terminal_code_block",
+                    None,
+                )
+                if _terminal_code_blocks is None:
+                    _terminal_code_blocks = getattr(
+                        _progress_adapter,
+                        "supports_code_blocks",
+                        False,
+                    )
+
+                if _terminal_code_blocks:
+                    # Consecutive terminal calls: drop the repeated
+                    # "💻 terminal" header so back-to-back commands render as
+                    # adjacent code blocks under a single header.
+                    _block_header = (
+                        "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
+                    )
+                    _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
+                    _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
@@ -14646,10 +14666,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
             # Terminal commands on markdown platforms get a single-line capped
-            # fenced block (built above) instead of the truncated preview.
+            # preview instead of the truncated preview.
             if _code_block_short is not None:
                 msg = _code_block_short
                 last_was_terminal_block[0] = True
+            elif _terminal_short_preview is not None:
+                msg = _terminal_short_preview
+                last_was_terminal_block[0] = False
             elif preview:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()

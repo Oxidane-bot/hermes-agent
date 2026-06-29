@@ -2142,6 +2142,7 @@ DEFAULT_CONFIG = {
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
         "extra": {
             "rich_messages": True,      # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set False to force legacy MarkdownV2
+            "tool_progress_terminal_code_block": False,  # When False, terminal tool-progress stays as compact text instead of a fenced code block
         },
     },
 

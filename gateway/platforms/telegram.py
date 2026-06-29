@@ -431,6 +431,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # clients that accept but render rich messages poorly via
         # platforms.telegram.extra.rich_messages: false.
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", True)
+        # Tool-progress terminal commands can be rendered either as fenced code
+        # blocks (compact but visually tall) or as the historical short preview.
+        # Keep this separate from rich_messages so normal assistant replies still
+        # benefit from MarkdownV2 code blocks.
+        self.tool_progress_terminal_code_block: bool = self._coerce_bool_extra(
+            "tool_progress_terminal_code_block",
+            False,
+        )
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.

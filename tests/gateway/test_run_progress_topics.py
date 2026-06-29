@@ -1329,6 +1329,13 @@ class CodeBlockProgressAdapter(ProgressCaptureAdapter):
     supports_code_blocks = True
 
 
+class TerminalPreviewAdapter(ProgressCaptureAdapter):
+    """Telegram-style adapter: markdown-capable, but terminal code blocks disabled."""
+
+    supports_code_blocks = True
+    tool_progress_terminal_code_block = False
+
+
 class TerminalCommandAgent:
     """Emits a terminal tool.started with a real, multi-line command arg."""
 
@@ -1496,6 +1503,50 @@ async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_
     all_content = " ".join(call["content"] for call in adapter.sent)
     all_content += " ".join(call["content"] for call in adapter.edits)
     assert "```bash" not in all_content
+
+@pytest.mark.asyncio
+async def test_terminal_progress_uses_short_preview_when_code_blocks_disabled(monkeypatch, tmp_path):
+    """Telegram-style adapters keep normal Markdown replies, but terminal progress
+    should stay in the compact preview form when terminal code blocks are disabled."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TerminalCommandAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter = TerminalPreviewAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-terminal-preview",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    assert "```" not in all_content
+    assert 'terminal: "set -euo pipefail ..."' in all_content
+
 
 class MultiTerminalCommandAgent:
     """Emits several consecutive terminal tool.started events, then a
