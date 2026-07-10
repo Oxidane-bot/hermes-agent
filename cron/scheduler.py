@@ -136,6 +136,21 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+def _resolve_fallback_entry_api_key(entry: dict[str, Any]) -> str:
+    """Return an explicit API key for a configured fallback entry, if any."""
+    api_key = str(entry.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+    for hint_key in ("key_env", "api_key_env"):
+        env_name = str(entry.get(hint_key) or "").strip()
+        if not env_name:
+            continue
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
@@ -2817,6 +2832,20 @@ def run_job(
         # off-host call is ever made with a stored key.
         _guard_job_credential_exfil(job)
 
+        selected_fallback_index: int | None = None
+        primary_model_for_drift = str(model or "").strip()
+        primary_provider_for_drift = ""
+        if not (job.get("provider") or "").strip():
+            _model_cfg_for_drift = _cfg.get("model") or {}
+            if isinstance(_model_cfg_for_drift, dict):
+                primary_provider_for_drift = str(
+                    _model_cfg_for_drift.get("provider") or ""
+                ).strip()
+            if not primary_provider_for_drift:
+                primary_provider_for_drift = os.getenv(
+                    "HERMES_INFERENCE_PROVIDER", ""
+                ).strip()
+
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -2825,6 +2854,7 @@ def run_job(
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
                 "requested": job.get("provider"),
+                "target_model": model,
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
@@ -2834,14 +2864,22 @@ def run_job(
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
             fb_list = get_fallback_chain(_cfg)
             runtime = None
-            for entry in fb_list:
+            for index, entry in enumerate(fb_list):
                 try:
-                    fb_kwargs = {"requested": entry.get("provider")}
+                    fb_model = str(entry.get("model") or "").strip()
+                    fb_kwargs = {
+                        "requested": entry.get("provider"),
+                        "target_model": fb_model or None,
+                    }
                     if entry.get("base_url"):
                         fb_kwargs["explicit_base_url"] = entry["base_url"]
-                    if entry.get("api_key"):
-                        fb_kwargs["explicit_api_key"] = entry["api_key"]
+                    fb_api_key = _resolve_fallback_entry_api_key(entry)
+                    if fb_api_key:
+                        fb_kwargs["explicit_api_key"] = fb_api_key
                     runtime = resolve_runtime_provider(**fb_kwargs)
+                    if fb_model:
+                        model = fb_model
+                    selected_fallback_index = index
                     logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
                     break
                 except Exception as fb_exc:
@@ -2874,14 +2912,16 @@ def run_job(
         _drift: list[str] = []
         _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
         if _provider_snapshot and not (job.get("provider") or "").strip():
-            _current_provider = str(runtime.get("provider") or "").strip().lower()
+            _current_provider = (
+                primary_provider_for_drift or str(runtime.get("provider") or "")
+            ).strip().lower()
             if _current_provider and _current_provider != _provider_snapshot:
                 _drift.append(
                     f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                 )
         _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
         if _model_snapshot and not (job.get("model") or "").strip():
-            _current_model = str(model or "").strip().lower()
+            _current_model = primary_model_for_drift.lower()
             if _current_model and _current_model != _model_snapshot:
                 _drift.append(
                     f"model '{_model_snapshot}' -> '{_current_model}'"
@@ -2906,7 +2946,10 @@ def run_job(
                 f"(or pin the original values to keep them). See #44585."
             )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_chain = get_fallback_chain(_cfg)
+        if selected_fallback_index is not None:
+            fallback_chain = fallback_chain[selected_fallback_index + 1:]
+        fallback_model = fallback_chain or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:

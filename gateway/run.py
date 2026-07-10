@@ -229,6 +229,15 @@ def _non_conversational_metadata(
     return merged
 
 
+def _heartbeat_should_send_replacement(edit_result: Any) -> bool:
+    """Return True when a heartbeat edit result should fall back to send()."""
+    if edit_result is None:
+        return True
+    if getattr(edit_result, "success", False):
+        return False
+    return not bool(getattr(edit_result, "retryable", False))
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -8699,6 +8708,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _maybe_intercept_clarify_reply(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> bool:
+        """Resolve pending gateway clarify prompts from text or voice transcript."""
+        _clarify_mod = None
+        try:
+            from tools import clarify_gateway as _clarify_mod
+            _pending_clarify = _clarify_mod.get_pending_for_session(
+                session_key,
+                include_choice_prompts=True,
+            )
+        except Exception:
+            _pending_clarify = None
+        if _pending_clarify is None or _clarify_mod is None:
+            return False
+
+        _raw_clarify_reply = (event.text or "").strip()
+        if (
+            not _raw_clarify_reply
+            and event.message_type == MessageType.VOICE
+            and event.get_command() is None
+        ):
+            try:
+                _prepared_clarify_reply = await self._prepare_inbound_message_text(
+                    event=event,
+                    source=source,
+                    history=[],
+                    session_key=session_key,
+                )
+                _raw_clarify_reply = (_prepared_clarify_reply or "").strip()
+            except Exception:
+                logger.debug(
+                    "Gateway clarify voice transcript preparation failed",
+                    exc_info=True,
+                )
+
+        # Skip slash commands: the user clearly wanted a command, not a
+        # clarify answer. Leave the prompt pending so they can retry.
+        if not _raw_clarify_reply or _raw_clarify_reply.startswith("/"):
+            return False
+
+        _resolved = _clarify_mod.resolve_text_response_for_session(
+            session_key,
+            _raw_clarify_reply,
+        )
+        if _resolved:
+            logger.info(
+                "Gateway intercepted clarify text response (session=%s, id=%s)",
+                session_key,
+                _pending_clarify.clarify_id,
+            )
+        return bool(_resolved)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -8922,38 +8987,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 _update_prompts.pop(_quick_key, None)
 
-        # Intercept messages that are responses to a pending clarify.
-        # Open-ended prompts and "Other" responses are captured as free text;
-        # direct replies to multi-choice prompts are accepted too ("2" maps
-        # to the second option, arbitrary text becomes a custom answer). Slash
-        # commands still bypass this path so /stop and friends keep working.
-        _clarify_mod = None
-        try:
-            from tools import clarify_gateway as _clarify_mod
-            _pending_clarify = _clarify_mod.get_pending_for_session(
-                _quick_key, include_choice_prompts=True,
-            )
-        except Exception:
-            _pending_clarify = None
-        if _pending_clarify is not None and _clarify_mod is not None:
-            _raw_clarify_reply = (event.text or "").strip()
-            # Skip slash commands — the user clearly wanted to issue a
-            # command, not answer the clarify.  Leave the clarify pending
-            # so the user can retry; if it times out, the agent unblocks
-            # with an empty response.
-            if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
-                )
-                if _resolved:
-                    logger.info(
-                        "Gateway intercepted clarify text response (session=%s, id=%s)",
-                        _quick_key, _pending_clarify.clarify_id,
-                    )
-                    # Acknowledge with empty string so adapters that emit
-                    # the agent's response don't double-post.  The agent
-                    # itself will produce the next user-facing message.
-                    return ""
+        if await self._maybe_intercept_clarify_reply(event, source, _quick_key):
+            # Acknowledge with empty string so adapters that emit the agent's
+            # response don't double-post.  The agent itself will produce the
+            # next user-facing message.
+            return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
@@ -19089,7 +19127,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
+                    if _heartbeat_should_send_replacement(_notify_res):
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
