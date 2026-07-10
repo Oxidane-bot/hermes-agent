@@ -1955,6 +1955,127 @@ class TestRunJobConfigEnvVarExpansion:
         models = [e.get("model") for e in fb if isinstance(e, dict)]
         assert models == ["gpt-4o-mini", "claude-sonnet-4-6"]
 
+    def test_auth_fallback_runtime_model_key_and_chain_are_consistent(self, tmp_path, monkeypatch):
+        """Auth fallback should run the selected entry, not primary-model params."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model: primary-model\n"
+            "fallback_providers:\n"
+            "  - provider: custom-fallback\n"
+            "    model: fallback-distinct-model\n"
+            "    base_url: https://fallback.invalid/v1\n"
+            "    key_env: _HERMES_TEST_CRON_FALLBACK_KEY\n"
+            "  - provider: openrouter\n"
+            "    model: downstream-model\n"
+        )
+        monkeypatch.setenv("_HERMES_TEST_CRON_FALLBACK_KEY", "fallback-secret")
+
+        job = {"id": "auth-fallback-job", "name": "auth fallback", "prompt": "hi"}
+        fake_db = MagicMock()
+
+        def _resolve_runtime_provider(**kwargs):
+            if kwargs.get("requested") is None:
+                raise AuthError("primary auth failed")
+            assert kwargs == {
+                "requested": "custom-fallback",
+                "explicit_base_url": "https://fallback.invalid/v1",
+                "explicit_api_key": "fallback-secret",
+                "target_model": "fallback-distinct-model",
+            }
+            return {
+                "api_key": kwargs["explicit_api_key"],
+                "base_url": kwargs["explicit_base_url"],
+                "provider": kwargs["requested"],
+                "api_mode": "codex_responses",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=_resolve_runtime_provider), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "fallback-distinct-model"
+        assert kwargs["provider"] == "custom-fallback"
+        assert kwargs["base_url"] == "https://fallback.invalid/v1"
+        assert kwargs["api_key"] == "fallback-secret"
+        assert kwargs["api_mode"] == "codex_responses"
+        assert [entry["model"] for entry in kwargs["fallback_model"]] == ["downstream-model"]
+
+    def test_auth_fallback_does_not_bypass_unpinned_snapshot_drift(
+        self, tmp_path, monkeypatch
+    ):
+        """Auth fallback must not spend on an unpinned job after default drift."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: drifted-primary-provider\n"
+            "  default: drifted-primary-model\n"
+            "fallback_providers:\n"
+            "  - provider: fallback-provider\n"
+            "    model: fallback-model\n"
+            "    base_url: https://fallback.invalid/v1\n"
+            "    key_env: _HERMES_TEST_CRON_FALLBACK_KEY\n"
+        )
+        monkeypatch.setenv("_HERMES_TEST_CRON_FALLBACK_KEY", "fallback-secret")
+
+        job = {
+            "id": "drift-auth-fallback-job",
+            "name": "drift auth fallback",
+            "prompt": "hi",
+            "provider_snapshot": "snapshot-provider",
+            "model_snapshot": "snapshot-model",
+        }
+        fake_db = MagicMock()
+
+        def _resolve_runtime_provider(**kwargs):
+            if kwargs.get("requested") is None:
+                raise AuthError("primary auth failed")
+            assert kwargs == {
+                "requested": "fallback-provider",
+                "explicit_base_url": "https://fallback.invalid/v1",
+                "explicit_api_key": "fallback-secret",
+                "target_model": "fallback-model",
+            }
+            return {
+                "api_key": kwargs["explicit_api_key"],
+                "base_url": kwargs["explicit_base_url"],
+                "provider": kwargs["requested"],
+                "api_mode": "codex_responses",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=_resolve_runtime_provider), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        mock_agent_cls.assert_not_called()
+        assert success is False
+        assert error is not None
+        assert "drifted since this job was created" in error
+
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")

@@ -75,3 +75,27 @@ def test_dump_leaves_unset_key_untouched(monkeypatch, capsys, tmp_path):
     line = _api_key_line(capsys.readouterr().out, "tavily")
     assert "not set" in line
     assert "shell only" not in line
+
+
+def test_dump_reports_tavily_numbered_pool_without_key_value(
+    monkeypatch, capsys, tmp_path
+):
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+
+    sentinel = "TAVILY_NUMBERED_SECRET_DO_NOT_PRINT"
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".env").write_text(f"TAVILY_API_KEY_1={sentinel}\n")
+
+    dump.run_dump(SimpleNamespace(show_keys=False))
+
+    output = capsys.readouterr().out
+    line = _api_key_line(output, "tavily")
+    assert "set" in line
+    assert "pool" in line
+    assert "1 key" in line
+    assert sentinel not in output

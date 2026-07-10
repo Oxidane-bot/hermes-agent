@@ -15,6 +15,32 @@ def test_show_status_all_does_not_print_tavily_key_value(monkeypatch, capsys, tm
     assert sentinel not in output
 
 
+def test_show_status_reports_tavily_numbered_pool_without_key_value(
+    monkeypatch, capsys, tmp_path
+):
+    from hermes_cli import config as config_mod
+    from hermes_cli import status as status_mod
+
+    sentinel = "TAVILY_NUMBERED_SECRET_DO_NOT_PRINT"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    def _env_value(name):
+        return {"TAVILY_API_KEY_1": sentinel}.get(name)
+
+    monkeypatch.setattr(config_mod, "get_env_value", _env_value)
+    monkeypatch.setattr(status_mod, "get_env_value", _env_value)
+
+    status_mod.show_status(SimpleNamespace(all=True, deep=False))
+
+    output = capsys.readouterr().out
+    tavily_line = next(line for line in output.splitlines() if "Tavily" in line)
+    assert "✓" in tavily_line
+    assert "pool" in tavily_line
+    assert "1 key" in tavily_line
+    assert sentinel not in output
+
+
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):
     from hermes_cli import status as status_mod
     import hermes_cli.auth as auth_mod
