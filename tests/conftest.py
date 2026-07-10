@@ -104,6 +104,7 @@ _CREDENTIAL_NAMES = frozenset({
     "PARALLEL_API_KEY",
     "EXA_API_KEY",
     "TAVILY_API_KEY",
+    "TAVILY_API_KEYS",
     "WANDB_API_KEY",
     "ELEVENLABS_API_KEY",
     "HONCHO_API_KEY",
@@ -161,6 +162,8 @@ _CREDENTIAL_NAMES = frozenset({
 
 def _looks_like_credential(name: str) -> bool:
     """True if env var name matches a credential-shaped pattern."""
+    if name.startswith("TAVILY_API_KEY_") and name.removeprefix("TAVILY_API_KEY_").isdigit():
+        return True
     if name in _CREDENTIAL_NAMES:
         return True
     return any(name.endswith(suf) for suf in _CREDENTIAL_SUFFIXES)

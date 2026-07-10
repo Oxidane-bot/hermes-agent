@@ -1,17 +1,21 @@
-"""Regression tests for voice replies to pending gateway clarify prompts."""
+"""Clarify text interception for Telegram voice replies."""
 
 from __future__ import annotations
 
-from types import MethodType
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
-def _clear_clarify_state():
+SESSION_KEY = "agent:main:telegram:dm:chat-1"
+
+
+def _clear_clarify_state() -> None:
     from tools import clarify_gateway as cm
 
     with cm._lock:
@@ -20,20 +24,51 @@ def _clear_clarify_state():
         cm._notify_cbs.clear()
 
 
-def _make_source() -> SessionSource:
+def _source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id="12345",
+        chat_id="chat-1",
         chat_type="dm",
-        user_id="777",
+        user_id="user-1",
         user_name="Tester",
+    )
+
+
+def _event(
+    text: str = "",
+    *,
+    message_type: MessageType = MessageType.TEXT,
+    media_urls: list[str] | None = None,
+    media_types: list[str] | None = None,
+) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=message_type,
+        source=_source(),
+        message_id="msg-1",
+        media_urls=media_urls or [],
+        media_types=media_types or [],
     )
 
 
 def _make_runner():
     from gateway.run import GatewayRunner
 
-    return object.__new__(GatewayRunner)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.adapters = {}
+    runner.hooks = SimpleNamespace(emit_collect=AsyncMock(return_value=[]))
+    runner._voice_mode = {}
+    runner._update_prompt_pending = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_key_for_source = lambda _source: SESSION_KEY
+    runner._prepare_inbound_message_text = AsyncMock(
+        side_effect=AssertionError("inbound prep should not run")
+    )
+    return runner
 
 
 @pytest.fixture(autouse=True)
@@ -44,92 +79,108 @@ def clear_clarify_state():
 
 
 @pytest.mark.asyncio
-async def test_pending_clarify_resolves_text_reply_without_preprocessing():
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ("2", "Beta"),
+        ("custom answer", "custom answer"),
+    ],
+)
+async def test_text_reply_resolves_pending_choice_clarify(reply: str, expected: str):
     from tools import clarify_gateway as cm
 
     runner = _make_runner()
-    session_key = "agent:main:telegram:dm:12345"
-    source = _make_source()
-    cm.register("cid-text", session_key, "Answer?", None)
+    event = _event(reply)
+    cm.register("clarify-text", SESSION_KEY, "Pick one", ["Alpha", "Beta"])
 
-    event = MessageEvent(
-        text="plain answer",
-        message_type=MessageType.TEXT,
-        source=source,
-    )
-
-    resolved = await runner._maybe_resolve_pending_clarify(
-        session_key=session_key,
-        event=event,
-        source=source,
+    resolved = await runner._maybe_intercept_clarify_reply(
+        event,
+        event.source,
+        SESSION_KEY,
     )
 
     assert resolved is True
-    assert cm.wait_for_response("cid-text", timeout=0.1) == "plain answer"
+    assert cm._entries["clarify-text"].response == expected
+    assert cm._entries["clarify-text"].event.is_set()
+    runner._prepare_inbound_message_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_pending_clarify_voice_reply_is_transcribed_before_resolve():
+async def test_voice_reply_uses_transcript_to_resolve_pending_clarify():
     from tools import clarify_gateway as cm
 
     runner = _make_runner()
-    session_key = "agent:main:telegram:dm:12345"
-    source = _make_source()
-    cm.register("cid-voice", session_key, "Say the answer", None)
-
-    calls = []
-
-    async def fake_prepare(self, *, event, source, history):
-        calls.append((event, source, history))
-        return "transcribed answer"
-
-    runner._prepare_inbound_message_text = MethodType(fake_prepare, runner)
-    event = MessageEvent(
-        text="",
+    runner._prepare_inbound_message_text = AsyncMock(return_value="  spoken answer  ")
+    event = _event(
         message_type=MessageType.VOICE,
-        source=source,
         media_urls=["/tmp/voice.ogg"],
         media_types=["audio/ogg"],
     )
+    cm.register("clarify-voice", SESSION_KEY, "Say anything", None)
 
-    resolved = await runner._maybe_resolve_pending_clarify(
-        session_key=session_key,
-        event=event,
-        source=source,
+    resolved = await runner._maybe_intercept_clarify_reply(
+        event,
+        event.source,
+        SESSION_KEY,
     )
 
     assert resolved is True
-    assert len(calls) == 1
-    assert calls[0][2] == []
-    assert cm.wait_for_response("cid-voice", timeout=0.1) == "transcribed answer"
+    runner._prepare_inbound_message_text.assert_awaited_once_with(
+        event=event,
+        source=event.source,
+        history=[],
+        session_key=SESSION_KEY,
+    )
+    assert cm._entries["clarify-voice"].response == "spoken answer"
+    assert cm._entries["clarify-voice"].event.is_set()
 
 
 @pytest.mark.asyncio
-async def test_pending_clarify_empty_voice_transcript_stays_pending():
+async def test_voice_reply_empty_transcript_leaves_clarify_pending():
     from tools import clarify_gateway as cm
 
     runner = _make_runner()
-    session_key = "agent:main:telegram:dm:12345"
-    source = _make_source()
-    cm.register("cid-empty", session_key, "Say the answer", None)
-
-    async def fake_prepare(self, *, event, source, history):
-        return ""
-
-    runner._prepare_inbound_message_text = MethodType(fake_prepare, runner)
-    event = MessageEvent(
-        text="",
+    runner._prepare_inbound_message_text = AsyncMock(return_value="  ")
+    event = _event(
         message_type=MessageType.VOICE,
-        source=source,
         media_urls=["/tmp/voice.ogg"],
         media_types=["audio/ogg"],
     )
+    cm.register("clarify-empty", SESSION_KEY, "Say anything", None)
 
-    resolved = await runner._maybe_resolve_pending_clarify(
-        session_key=session_key,
-        event=event,
-        source=source,
+    resolved = await runner._maybe_intercept_clarify_reply(
+        event,
+        event.source,
+        SESSION_KEY,
     )
 
     assert resolved is False
-    assert cm.get_pending_for_session(session_key) is not None
+    runner._prepare_inbound_message_text.assert_awaited_once()
+    pending = cm.get_pending_for_session(SESSION_KEY, include_choice_prompts=True)
+    assert pending is not None
+    assert pending.clarify_id == "clarify-empty"
+
+
+@pytest.mark.asyncio
+async def test_audio_reply_does_not_invoke_stt_and_leaves_clarify_pending():
+    from tools import clarify_gateway as cm
+
+    runner = _make_runner()
+    event = _event(
+        message_type=MessageType.AUDIO,
+        media_urls=["/tmp/song.mp3"],
+        media_types=["audio/mpeg"],
+    )
+    cm.register("clarify-audio", SESSION_KEY, "Say anything", None)
+
+    resolved = await runner._maybe_intercept_clarify_reply(
+        event,
+        event.source,
+        SESSION_KEY,
+    )
+
+    assert resolved is False
+    runner._prepare_inbound_message_text.assert_not_awaited()
+    pending = cm.get_pending_for_session(SESSION_KEY, include_choice_prompts=True)
+    assert pending is not None
+    assert pending.clarify_id == "clarify-audio"

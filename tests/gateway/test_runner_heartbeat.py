@@ -1,24 +1,22 @@
+"""Tests for gateway long-running heartbeat replacement-send decisions."""
+
+from types import SimpleNamespace
+
+import pytest
+
 from gateway.platforms.base import SendResult
-from gateway.run import _should_send_fresh_heartbeat
+from gateway.run import _heartbeat_should_send_replacement
 
 
-def test_heartbeat_sends_fresh_message_before_first_message_exists():
-    assert _should_send_fresh_heartbeat(None) is True
-
-
-def test_heartbeat_does_not_resend_when_edit_succeeds():
-    assert _should_send_fresh_heartbeat(
-        SendResult(success=True, message_id="123")
-    ) is False
-
-
-def test_heartbeat_does_not_resend_on_retryable_edit_failure():
-    assert _should_send_fresh_heartbeat(
-        SendResult(success=False, error="httpx.ConnectError", retryable=True)
-    ) is False
-
-
-def test_heartbeat_resends_on_nonretryable_edit_failure():
-    assert _should_send_fresh_heartbeat(
-        SendResult(success=False, error="message to edit not found", retryable=False)
-    ) is True
+@pytest.mark.parametrize(
+    ("edit_result", "expected"),
+    [
+        (None, True),
+        (SendResult(success=True, message_id="heartbeat-1"), False),
+        (SendResult(success=False, error="timeout", retryable=True), False),
+        (SendResult(success=False, error="not found", retryable=False), True),
+        (SimpleNamespace(success=False), True),
+    ],
+)
+def test_heartbeat_replacement_send_decision(edit_result, expected):
+    assert _heartbeat_should_send_replacement(edit_result) is expected

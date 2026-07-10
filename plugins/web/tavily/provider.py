@@ -18,27 +18,22 @@ Config keys this provider responds to::
 Env vars::
 
     TAVILY_API_KEY=...           # https://app.tavily.com/home (required)
-                                # May contain multiple keys separated by
-                                # comma, semicolon, or whitespace.
-    TAVILY_API_KEYS=...          # optional explicit multi-key pool;
-                                # comma/newline list or JSON array
+    TAVILY_API_KEYS=...          # optional explicit multi-key pool
+    TAVILY_API_KEY_1=...         # optional numbered process-env key
     TAVILY_BASE_URL=...          # optional override of https://api.tavily.com
-    TAVILY_KEY_COOLDOWN_SECONDS=172800
-                                # optional cooldown after quota/auth failures
-
-Auth note: Tavily uses ``api_key`` in the JSON body for /search and
-/extract, but **also requires** ``Authorization: Bearer <key>`` for /crawl
-(body-only auth returns 401 on /crawl). The plugin handles both.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -46,15 +41,19 @@ from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-_TAVILY_DEFAULT_KEY_COOLDOWN_SECONDS = 2 * 24 * 60 * 60
+_DEFAULT_TAVILY_COOLDOWN_SECONDS = 300.0
+_MAX_TAVILY_RETRY_AFTER_SECONDS = 86_400.0
+_CONFIG_NUMBERED_TAVILY_KEY_LIMIT = 20
 _TAVILY_TRANSIENT_HTTP_STATUSES = {408, 409, 425, 500, 502, 503, 504, 529}
 _TAVILY_QUOTA_HTTP_STATUSES = {401, 402, 403, 429}
 _TAVILY_STATE_LOCK = threading.Lock()
 
 
 def _split_tavily_api_keys(raw: str) -> List[str]:
-    """Split one env var value into one or more Tavily API keys."""
-    stripped = raw.strip()
+    """Split one env var value into one or more Tavily keys."""
+    stripped = (raw or "").strip()
+    if not stripped:
+        return []
     if stripped.startswith("["):
         try:
             parsed = json.loads(stripped)
@@ -62,25 +61,25 @@ def _split_tavily_api_keys(raw: str) -> List[str]:
             parsed = None
         if isinstance(parsed, list):
             return [str(part).strip() for part in parsed if str(part).strip()]
-    return [part.strip() for part in re.split(r"[\s,;]+", raw) if part.strip()]
+    return [part.strip() for part in re.split(r"[\s,;]+", stripped) if part.strip()]
 
 
 def _get_tavily_api_keys() -> List[str]:
-    """Return configured Tavily API keys in fill-first order.
+    """Return Tavily keys in stable first-seen order with duplicates removed."""
+    from agent.web_search_provider import get_provider_env
 
-    Backward compatible with a single ``TAVILY_API_KEY`` while also allowing
-    multiple keys via comma/newline-separated ``TAVILY_API_KEY`` or the
-    explicit plural ``TAVILY_API_KEYS``. Numbered vars are accepted for users
-    who prefer one key per line in process managers:
-    ``TAVILY_API_KEY_1``, ``TAVILY_API_KEY_2``, ...
-    """
     raw_values: List[str] = []
     for name in ("TAVILY_API_KEY", "TAVILY_API_KEYS"):
-        value = os.getenv(name, "")
-        if value.strip():
+        value = get_provider_env(name)
+        if value:
             raw_values.append(value)
 
-    numbered: list[tuple[int, str]] = []
+    for index in range(1, _CONFIG_NUMBERED_TAVILY_KEY_LIMIT + 1):
+        value = get_provider_env(f"TAVILY_API_KEY_{index}")
+        if value:
+            raw_values.append(value)
+
+    numbered: List[tuple[int, str]] = []
     for name, value in os.environ.items():
         match = re.fullmatch(r"TAVILY_API_KEY_(\d+)", name)
         if match and value.strip():
@@ -97,142 +96,102 @@ def _get_tavily_api_keys() -> List[str]:
     return keys
 
 
+def _has_tavily_pool_source() -> bool:
+    from agent.web_search_provider import get_provider_env
+
+    if get_provider_env("TAVILY_API_KEYS"):
+        return True
+    for index in range(1, _CONFIG_NUMBERED_TAVILY_KEY_LIMIT + 1):
+        if get_provider_env(f"TAVILY_API_KEY_{index}"):
+            return True
+    return any(re.fullmatch(r"TAVILY_API_KEY_(\d+)", name) for name in os.environ)
+
+
+def tavily_key_pool_summary() -> Optional[str]:
+    """Return a non-secret user-facing summary for Tavily key pools."""
+    keys = _get_tavily_api_keys()
+    if not keys or not (_has_tavily_pool_source() or len(keys) > 1):
+        return None
+    suffix = "key" if len(keys) == 1 else "keys"
+    return f"set (pool: {len(keys)} {suffix})"
+
+
 def _tavily_key_fingerprint(api_key: str) -> str:
-    """Stable non-secret key identifier for cooldown state and logs."""
+    """Stable irreversible key identifier used for persistence and logs."""
     return sha256(api_key.encode("utf-8")).hexdigest()[:16]
 
 
 def _tavily_state_path() -> str:
-    try:
-        from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home
 
-        base = get_hermes_home()
-    except ImportError:
-        from pathlib import Path
-
-        base = Path.home() / ".hermes"
-    return str(base / "rate_limits" / "tavily_keys.json")
+    return str(get_hermes_home() / "rate_limits" / "tavily_keys.json")
 
 
 def _load_tavily_key_state() -> Dict[str, Any]:
-    path = _tavily_state_path()
     try:
-        with open(path, encoding="utf-8") as f:
-            state = json.load(f)
-        return state if isinstance(state, dict) else {}
+        with open(_tavily_state_path(), encoding="utf-8") as fh:
+            state = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
+    return state if isinstance(state, dict) else {}
 
 
 def _save_tavily_key_state(state: Dict[str, Any]) -> None:
-    try:
-        from utils import atomic_json_write
+    from utils import atomic_json_write
 
-        atomic_json_write(_tavily_state_path(), state)
-    except Exception as exc:  # noqa: BLE001 — state is best-effort
-        logger.debug("Failed to persist Tavily key state: %s", exc)
+    atomic_json_write(_tavily_state_path(), state)
 
 
-def _configured_tavily_key_cooldown_seconds() -> float:
-    raw = os.getenv("TAVILY_KEY_COOLDOWN_SECONDS", "").strip()
-    if not raw:
-        return float(_TAVILY_DEFAULT_KEY_COOLDOWN_SECONDS)
-    try:
-        return max(60.0, float(raw))
-    except ValueError:
-        logger.debug("Ignoring invalid TAVILY_KEY_COOLDOWN_SECONDS=%r", raw)
-        return float(_TAVILY_DEFAULT_KEY_COOLDOWN_SECONDS)
+def _cleanup_tavily_key_state(
+    state: Dict[str, Any], *, now: Optional[float] = None
+) -> Dict[str, Any]:
+    """Drop expired or malformed entries and keep only hashed cooldown state."""
+    now = time.time() if now is None else now
+    entries = state.get("keys")
+    if not isinstance(entries, dict):
+        return {}
+
+    cleaned: Dict[str, Dict[str, float]] = {}
+    for fingerprint, entry in entries.items():
+        if not isinstance(fingerprint, str) or not isinstance(entry, dict):
+            continue
+        try:
+            cooldown_until = float(entry.get("cooldown_until") or 0)
+            updated_at = float(entry.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(cooldown_until) or not math.isfinite(updated_at):
+            continue
+        if cooldown_until <= now:
+            continue
+        cleaned[fingerprint] = {
+            "cooldown_until": cooldown_until,
+            "updated_at": updated_at,
+        }
+    return {"keys": cleaned} if cleaned else {}
 
 
 def _parse_retry_after_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float]:
     if not headers:
         return None
-    lowered = {str(k).lower(): str(v) for k, v in headers.items()}
-    for key in (
-        "retry-after",
-        "x-ratelimit-reset",
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset-requests-1h",
-    ):
-        raw = lowered.get(key)
-        if raw is None:
+    for key, value in headers.items():
+        if str(key).lower() != "retry-after":
             continue
+        raw = str(value).strip()
         try:
             seconds = float(raw)
         except ValueError:
-            continue
-        if seconds > 0:
-            return seconds
+            try:
+                parsed = parsedate_to_datetime(raw)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            seconds = parsed.timestamp() - time.time()
+        if not math.isfinite(seconds) or seconds <= 0:
+            return None
+        return min(seconds, _MAX_TAVILY_RETRY_AFTER_SECONDS)
     return None
-
-
-def _tavily_key_cooldown_remaining(api_key: str, *, now: Optional[float] = None) -> float:
-    now = time.time() if now is None else now
-    fingerprint = _tavily_key_fingerprint(api_key)
-    with _TAVILY_STATE_LOCK:
-        state = _load_tavily_key_state()
-        entry = (state.get("keys") or {}).get(fingerprint) or {}
-    try:
-        cooldown_until = float(entry.get("cooldown_until") or 0)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, cooldown_until - now)
-
-
-def _available_tavily_api_keys(keys: List[str]) -> List[str]:
-    """Return keys not currently cooled down, preserving configured order."""
-    now = time.time()
-    return [key for key in keys if _tavily_key_cooldown_remaining(key, now=now) <= 0]
-
-
-def _record_tavily_key_success(api_key: str) -> None:
-    fingerprint = _tavily_key_fingerprint(api_key)
-    now = time.time()
-    with _TAVILY_STATE_LOCK:
-        state = _load_tavily_key_state()
-        keys_state = state.get("keys") or {}
-        entry = keys_state.get(fingerprint)
-        if not isinstance(entry, dict):
-            return
-        entry.pop("cooldown_until", None)
-        entry.pop("last_error", None)
-        entry.pop("last_status", None)
-        entry["last_success_at"] = now
-        entry["updated_at"] = now
-        state["keys"] = keys_state
-        _save_tavily_key_state(state)
-
-
-def _record_tavily_key_cooldown(
-    api_key: str,
-    *,
-    reason: str,
-    status_code: Optional[int] = None,
-    headers: Optional[Mapping[str, str]] = None,
-    error: Optional[BaseException] = None,
-) -> float:
-    now = time.time()
-    cooldown_seconds = _parse_retry_after_seconds(headers)
-    if cooldown_seconds is None:
-        cooldown_seconds = _configured_tavily_key_cooldown_seconds()
-    cooldown_until = now + cooldown_seconds
-    fingerprint = _tavily_key_fingerprint(api_key)
-    with _TAVILY_STATE_LOCK:
-        state = _load_tavily_key_state()
-        keys_state = state.setdefault("keys", {})
-        entry = keys_state.setdefault(fingerprint, {})
-        entry.update(
-            {
-                "cooldown_until": cooldown_until,
-                "reason": reason,
-                "last_status": status_code,
-                "last_error": str(error)[:300] if error else "",
-                "updated_at": now,
-            }
-        )
-        entry["failure_count"] = int(entry.get("failure_count") or 0) + 1
-        _save_tavily_key_state(state)
-    return cooldown_seconds
 
 
 def _http_status_from_exception(exc: BaseException) -> Optional[int]:
@@ -247,12 +206,63 @@ def _http_headers_from_exception(exc: BaseException) -> Optional[Mapping[str, st
     return headers if isinstance(headers, Mapping) else None
 
 
+def _response_body_indicates_quota_or_auth(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return False
+
+    text = ""
+    try:
+        parsed = response.json()
+    except Exception:  # noqa: BLE001
+        parsed = None
+    if parsed is not None:
+        try:
+            text = json.dumps(parsed, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(parsed)
+    else:
+        body = getattr(response, "text", None)
+        if isinstance(body, str):
+            text = body
+
+    lowered = text.lower()
+    return any(
+        token in lowered
+        for token in (
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "usage limit",
+            "credits",
+            "unauthorized",
+            "forbidden",
+            "invalid api key",
+        )
+    )
+
+
 def _is_tavily_quota_or_auth_failure(exc: BaseException) -> bool:
     status_code = _http_status_from_exception(exc)
     if status_code in _TAVILY_QUOTA_HTTP_STATUSES:
         return True
-    text = str(exc).lower()
-    return any(token in text for token in ("quota", "rate limit", "rate_limit", "usage limit", "credit"))
+    if _response_body_indicates_quota_or_auth(exc):
+        return True
+    lowered = str(exc).lower()
+    return any(
+        token in lowered
+        for token in (
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "usage limit",
+            "credits",
+            "unauthorized",
+            "forbidden",
+        )
+    )
 
 
 def _is_tavily_retryable_without_cooldown(exc: BaseException) -> bool:
@@ -262,14 +272,60 @@ def _is_tavily_retryable_without_cooldown(exc: BaseException) -> bool:
     return status_code in _TAVILY_TRANSIENT_HTTP_STATUSES
 
 
+def _cooldown_remaining_for_key(
+    api_key: str, *, now: Optional[float] = None
+) -> float:
+    now = time.time() if now is None else now
+    fingerprint = _tavily_key_fingerprint(api_key)
+    with _TAVILY_STATE_LOCK:
+        state = _cleanup_tavily_key_state(_load_tavily_key_state(), now=now)
+    entry = (state.get("keys") or {}).get(fingerprint) or {}
+    try:
+        cooldown_until = float(entry.get("cooldown_until") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(cooldown_until):
+        return 0.0
+    return max(0.0, cooldown_until - now)
+
+
+def _available_tavily_api_keys(keys: List[str]) -> List[str]:
+    """Return keys that are not currently cooling down."""
+    now = time.time()
+    return [key for key in keys if _cooldown_remaining_for_key(key, now=now) <= 0]
+
+
+def _record_tavily_key_cooldown(
+    api_key: str, *, headers: Optional[Mapping[str, str]] = None
+) -> float:
+    """Persist cooldown state using only a key fingerprint and timestamps."""
+    now = time.time()
+    cooldown_seconds = _parse_retry_after_seconds(headers)
+    if cooldown_seconds is None:
+        cooldown_seconds = _DEFAULT_TAVILY_COOLDOWN_SECONDS
+
+    with _TAVILY_STATE_LOCK:
+        state = _cleanup_tavily_key_state(_load_tavily_key_state(), now=now)
+        keys_state = state.setdefault("keys", {})
+        keys_state[_tavily_key_fingerprint(api_key)] = {
+            "cooldown_until": now + cooldown_seconds,
+            "updated_at": now,
+        }
+        _save_tavily_key_state(state)
+
+    return cooldown_seconds
+
+
 def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST to the Tavily API and return the parsed JSON response.
 
     Mirrors :func:`tools.web_tools._tavily_request`. Raises ``ValueError``
-    when ``TAVILY_API_KEY`` is unset; the caller catches and surfaces as
+    when no Tavily keys are configured; the caller catches and surfaces as
     a typed error response.
     """
     import httpx
+
+    from agent.web_search_provider import get_provider_env
 
     api_keys = _get_tavily_api_keys()
     if not api_keys:
@@ -277,53 +333,42 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "TAVILY_API_KEY environment variable not set. "
             "Get your API key at https://app.tavily.com/home"
         )
+
     available_keys = _available_tavily_api_keys(api_keys)
     if not available_keys:
-        waits = [
-            _tavily_key_cooldown_remaining(key)
-            for key in api_keys
-        ]
-        next_retry = min((wait for wait in waits if wait > 0), default=0)
+        next_retry = min(
+            (_cooldown_remaining_for_key(key) for key in api_keys),
+            default=0.0,
+        )
         raise ValueError(
             "All configured Tavily API keys are cooling down after recent "
             f"quota/auth failures; next retry in {int(next_retry)}s"
         )
 
-    base_url = os.getenv("TAVILY_BASE_URL", "https://api.tavily.com")
-    payload_template = dict(payload)  # don't mutate caller's dict
+    base_url = get_provider_env("TAVILY_BASE_URL") or "https://api.tavily.com"
     url = f"{base_url}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
 
     last_error: Optional[BaseException] = None
     for index, api_key in enumerate(available_keys, start=1):
-        payload_for_key = dict(payload_template)
-        payload_for_key["api_key"] = api_key
-        # Tavily /crawl requires Bearer header auth in addition to body auth;
-        # /search and /extract are body-only.
-        headers = {"Authorization": f"Bearer {api_key}"} if endpoint.strip("/") == "crawl" else {}
-
+        request_payload = dict(payload)
+        request_payload["api_key"] = api_key
         try:
-            response = httpx.post(url, json=payload_for_key, headers=headers, timeout=60)
+            response = httpx.post(url, json=request_payload, timeout=60)
             response.raise_for_status()
-            _record_tavily_key_success(api_key)
             return response.json()
-        except Exception as exc:  # noqa: BLE001 — failover handles HTTP + transport errors
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
-            status_code = _http_status_from_exception(exc)
             fingerprint = _tavily_key_fingerprint(api_key)
             remaining = len(available_keys) - index
             if _is_tavily_quota_or_auth_failure(exc):
                 cooldown = _record_tavily_key_cooldown(
                     api_key,
-                    reason="quota_or_auth_failure",
-                    status_code=status_code,
                     headers=_http_headers_from_exception(exc),
-                    error=exc,
                 )
                 logger.warning(
-                    "Tavily key %s failed with status %s; cooling down for %.0fs%s",
+                    "Tavily key %s unavailable; cooling down for %.0fs%s",
                     fingerprint,
-                    status_code,
                     cooldown,
                     f" and trying {remaining} more key(s)" if remaining else "",
                 )
@@ -331,9 +376,8 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     continue
             elif _is_tavily_retryable_without_cooldown(exc) and remaining:
                 logger.warning(
-                    "Tavily key %s hit transient error (%s); trying %d more key(s)",
+                    "Tavily key %s hit transient error; trying %d more key(s)",
                     fingerprint,
-                    exc,
                     remaining,
                 )
                 continue
@@ -422,7 +466,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
         return "Tavily"
 
     def is_available(self) -> bool:
-        """Return True when at least one Tavily API key is configured."""
+        """Return True when at least one Tavily key is configured."""
         return bool(_get_tavily_api_keys())
 
     def supports_search(self) -> bool:
@@ -498,12 +542,17 @@ class TavilyWebSearchProvider(WebSearchProvider):
             "env_vars": [
                 {
                     "key": "TAVILY_API_KEY",
-                    "prompt": "Tavily API key(s)",
+                    "prompt": "Tavily API key",
                     "url": "https://app.tavily.com/home",
                 },
                 {
                     "key": "TAVILY_API_KEYS",
-                    "prompt": "Tavily API keys",
+                    "prompt": "Optional Tavily API key pool (comma-separated or JSON list)",
+                    "url": "https://app.tavily.com/home",
+                },
+                {
+                    "key": "TAVILY_API_KEY_1",
+                    "prompt": "Optional numbered Tavily API key pool entry",
                     "url": "https://app.tavily.com/home",
                 },
             ],

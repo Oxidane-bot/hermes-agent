@@ -19,6 +19,38 @@ from hermes_constants import display_hermes_home
 from agent.skill_utils import is_excluded_skill_path
 
 
+def _dotenv_key_names() -> set[str]:
+    """Return the set of env-var names assigned a non-empty value in ~/.hermes/.env.
+
+    The managed backends (launchd / systemd / the desktop-spawned ``serve``
+    process) load credentials from this file — NOT from an interactive shell's
+    exports. ``hermes debug share`` runs in a terminal, so ``os.getenv`` reflects
+    the shell's environment, which can include exported keys the managed backend
+    never sees. Comparing against this set lets the dump flag that mismatch (the
+    exact trap behind #48504-style "no web_search" reports: key exported in the
+    shell, absent from .env, invisible to the launchd backend).
+    """
+    try:
+        env_path = get_env_path()
+        text = env_path.read_text(encoding="utf-8", errors="ignore")
+    except (OSError, UnicodeError):
+        return set()
+
+    names: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.lower().startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, _, value = line.partition("=")
+        name = name.strip()
+        # A bare `KEY=` (empty value) is effectively unset for the backend.
+        if name and value.strip().strip("'\""):
+            names.add(name)
+    return names
+
+
 def _get_git_commit(project_root: Path) -> str:
     """Return short git commit hash, or '(unknown)'.
 
@@ -349,19 +381,46 @@ def run_dump(args):
         ("KILOCODE_API_KEY", "kilocode"),
         ("FIRECRAWL_API_KEY", "firecrawl"),
         ("TAVILY_API_KEY", "tavily"),
-        ("TAVILY_API_KEYS", "tavily_pool"),
         ("BROWSERBASE_API_KEY", "browserbase"),
         ("FAL_KEY", "fal"),
         ("ELEVENLABS_API_KEY", "elevenlabs"),
         ("GITHUB_TOKEN", "github"),
     ]
 
+    dotenv_keys = _dotenv_key_names()
+    tavily_dotenv_pool = any(
+        key in dotenv_keys
+        for key in ("TAVILY_API_KEY", "TAVILY_API_KEYS")
+    ) or any(
+        key.startswith("TAVILY_API_KEY_") and key[len("TAVILY_API_KEY_"):].isdigit()
+        for key in dotenv_keys
+    )
+
     for env_var, label in api_keys:
         val = os.getenv(env_var, "")
+        pool_summary = None
         if show_keys and val:
             display = _redact(val)
         else:
             display = "set" if val else "not set"
+        if label == "tavily":
+            try:
+                from plugins.web.tavily.provider import tavily_key_pool_summary
+
+                pool_summary = tavily_key_pool_summary()
+            except Exception:
+                pool_summary = None
+            if pool_summary:
+                display = pool_summary
+                if not tavily_dotenv_pool:
+                    display += " (shell only — not in .env; managed/desktop backend may not see it)"
+        # Set in this (shell) process but absent from ~/.hermes/.env: a managed
+        # backend (launchd/systemd/desktop `serve`) loads .env, not the login
+        # shell, so it likely can't see this key — even though the dump reads
+        # "set". Flag it so support doesn't chase a phantom "key is configured"
+        # (the actual cause of gated tools like web_search going missing).
+        if val and env_var not in dotenv_keys and not (pool_summary and tavily_dotenv_pool):
+            display += " (shell only — not in .env; managed/desktop backend may not see it)"
         # A credential added via `hermes auth add openrouter` lives in the
         # credential pool, not as an env var — surface it so the dump doesn't
         # misleadingly read "not set" while `hermes auth list` shows it (#42130).

@@ -18,28 +18,14 @@ from tools.memory_tool import (
 
 class TestMemorySchema:
     def test_discourages_diary_style_task_logs(self):
-        description = MEMORY_SCHEMA["description"]
-        # Intent (not exact phrasing): discourage saving one-off/task logs,
-        # frame memory as a current-state profile, and point the model at
-        # session_search for past task detail instead.
-        assert "DO NOT SAVE" in description
-        assert "one-off investigations" in description
-        assert "version probes" in description
+        description = MEMORY_SCHEMA["description"].lower()
+        # Intent (not exact phrasing): discourage saving task progress / logs,
+        # and point the model at session_search for those instead.
+        assert "task progress" in description
         assert "session_search" in description
-        assert "current-state profile" in description
         assert "like a diary" not in description
-        assert "temporary TODO state" in description
+        assert "todo state" in description
         assert ">80%" not in description
-
-    def test_schema_requires_read_first_guidance(self):
-        description = MEMORY_SCHEMA["description"]
-        assert "READ FIRST" in description
-        assert "same target" in description
-        assert "add is the last resort" in description
-
-    def test_schema_allows_read_action(self):
-        action_schema = MEMORY_SCHEMA["parameters"]["properties"]["action"]
-        assert "read" in action_schema["enum"]
 
 
 # =========================================================================
@@ -344,6 +330,10 @@ class TestMemoryStoreReplace:
         store.add("memory", "fact A")
         result = store.replace("memory", "nonexistent", "new")
         assert result["success"] is False
+        assert "No entry matched" in result["error"]
+        # Zero-match must return current entries so the agent can self-correct
+        # instead of looping blindly (#42405, co-author #42417).
+        assert result["current_entries"] == ["fact A"]
 
     def test_replace_ambiguous_match(self, store):
         store.add("memory", "server A runs nginx")
@@ -375,41 +365,117 @@ class TestMemoryStoreRemove:
         assert len(store.memory_entries) == 0
 
     def test_remove_no_match(self, store):
+        store.add("memory", "fact A")
         result = store.remove("memory", "nonexistent")
         assert result["success"] is False
+        assert "No entry matched" in result["error"]
+        # Zero-match must return current entries (#42405, co-author #42417).
+        assert result["current_entries"] == ["fact A"]
 
     def test_remove_empty_old_text(self, store):
         result = store.remove("memory", "  ")
         assert result["success"] is False
 
 
-class TestMemoryStoreRead:
-    def test_read_entry(self, store):
-        store.add("memory", "fact A")
-        result = store.read("memory")
-        assert result["success"] is True
-        assert result["target"] == "memory"
-        assert result["entries"] == ["fact A"]
-        assert result["entry_count"] == 1
-        assert result["usage"]
-        assert result["path"].endswith("MEMORY.md")
+class TestMemoryConsolidationGracefulDegrade:
+    """Fix #3 for #42405: a failed at-capacity consolidation must never loop the
+    turn to budget exhaustion — after a per-turn cap of failures, memory ops
+    return a terminal 'stop, continue your reply' result instead of the
+    'retry — all in this turn' instruction."""
 
-    def test_read_user_target(self, store):
-        store.add("user", "Name: Alice")
-        result = store.read("user")
-        assert result["success"] is True
-        assert result["target"] == "user"
-        assert result["entries"] == ["Name: Alice"]
-        assert result["path"].endswith("USER.md")
-
-    def test_read_does_not_modify_file(self, store):
+    def test_zero_match_failures_degrade_after_cap(self, store):
         store.add("memory", "fact A")
-        path = store._path_for("memory")
-        before = path.read_text(encoding="utf-8")
-        result = store.read("memory")
-        after = path.read_text(encoding="utf-8")
-        assert result["success"] is True
-        assert after == before
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        # First `cap` failures still hand back previews + the self-correct hint.
+        for _ in range(cap):
+            r = store.replace("memory", "nonexistent", "new")
+            assert r["success"] is False
+            assert "current_entries" in r  # actionable feedback, keep trying
+            assert "retry with the exact text" in r["error"]
+        # The next failure degrades: terminal, no retry instruction.
+        r = store.replace("memory", "nonexistent", "new")
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "current_entries" not in r
+        assert "continue with your reply" in r["error"]
+
+    def test_add_overflow_degrades_after_cap(self, store):
+        # Fill near the 500-char user/memory limit so add() overflows.
+        store.add("memory", "x" * 200)
+        store.add("memory", "y" * 200)
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        big = "z" * 200
+        for _ in range(cap):
+            r = store.add("memory", big)
+            assert r["success"] is False
+            assert "retry this add" in r["error"]  # still instructs in-turn retry
+        r = store.add("memory", big)
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "continue with your reply" in r["error"]
+
+    def test_failures_mix_across_actions_share_one_budget(self, store):
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        # Interleave replace + remove failures — they share the per-turn counter.
+        actions = [lambda: store.replace("memory", "nope", "x"),
+                   lambda: store.remove("memory", "nope")]
+        for i in range(cap):
+            assert actions[i % 2]()["success"] is False
+        # cap+1th failure (any action) degrades.
+        r = store.remove("memory", "nope")
+        assert "continue with your reply" in r["error"]
+
+    def test_success_resets_failure_budget(self, store):
+        store.add("memory", "real entry")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        for _ in range(cap):
+            store.replace("memory", "nonexistent", "new")
+        # A successful op resets the counter — progress was made.
+        ok = store.replace("memory", "real entry", "updated entry")
+        assert ok["success"] is True
+        # Now a fresh failure is treated as the first again (still actionable).
+        r = store.replace("memory", "nonexistent", "new")
+        assert "current_entries" in r
+        assert "continue with your reply" not in r["error"]
+
+    def test_reset_consolidation_failures_clears_budget(self, store):
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        for _ in range(cap + 1):
+            store.replace("memory", "nonexistent", "new")
+        # New turn boundary resets the budget.
+        store.reset_consolidation_failures()
+        r = store.replace("memory", "nonexistent", "new")
+        assert "current_entries" in r  # actionable again, not degraded
+        assert "continue with your reply" not in r["error"]
+
+    def test_apply_batch_failures_count_toward_budget(self, store):
+        """apply_batch is the primary at-capacity consolidation path; its
+        failures must also degrade so a looping batch can't exhaust the turn
+        (#42405 whole-bug-class — sibling call path)."""
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        bad_batch = [{"action": "replace", "old_text": "nope", "content": "x"}]
+        for _ in range(cap):
+            r = store.apply_batch("memory", bad_batch)
+            assert r["success"] is False
+            assert "current_entries" in r  # still actionable under cap
+        r = store.apply_batch("memory", bad_batch)
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "continue with your reply" in r["error"]
+
+    def test_apply_batch_and_single_op_share_budget(self, store):
+        """A batch failure followed by single-op failures shares one counter."""
+        store.add("memory", "fact A")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        store.apply_batch("memory", [{"action": "remove", "old_text": "nope"}])
+        for _ in range(cap - 1):
+            store.replace("memory", "nope", "x")
+        # cap reached across batch + single ops → next degrades.
+        r = store.replace("memory", "nope", "x")
+        assert "continue with your reply" in r["error"]
 
 
 class TestMemoryStorePersistence:
@@ -469,6 +535,26 @@ class TestMemoryToolDispatcher:
         result = json.loads(memory_tool(action="add", target="invalid", content="x", store=store))
         assert result["success"] is False
 
+    def test_null_target_defaults_to_memory_store(self, store):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target=None,
+                content="Project uses pytest with xdist.",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert store.memory_entries == ["Project uses pytest with xdist."]
+        assert store.user_entries == []
+
+    def test_invalid_non_string_target_still_rejected(self, store):
+        result = json.loads(
+            memory_tool(action="add", target=42, content="via tool", store=store)
+        )
+        assert result["success"] is False
+        assert "Invalid target" in result["error"]
+
     def test_unknown_action(self, store):
         result = json.loads(memory_tool(action="unknown", store=store))
         assert result["success"] is False
@@ -477,20 +563,34 @@ class TestMemoryToolDispatcher:
         result = json.loads(memory_tool(action="add", target="memory", content="via tool", store=store))
         assert result["success"] is True
 
-    def test_read_via_tool(self, store):
-        memory_tool(action="add", target="memory", content="via tool", store=store)
-        result = json.loads(memory_tool(action="read", target="memory", store=store))
-        assert result["success"] is True
-        assert result["entries"] == ["via tool"]
-        assert result["path"].endswith("MEMORY.md")
-
     def test_replace_requires_old_text(self, store):
+        # Missing old_text on a single-op replace is recoverable, not a dead-end:
+        # return the current inventory + a retry instruction so the model can
+        # reissue with old_text set. (issues #43412, #49466)
+        store.add("memory", "fact A")
+        store.add("memory", "fact B")
         result = json.loads(memory_tool(action="replace", content="new", store=store))
         assert result["success"] is False
+        assert "old_text" in result["error"]
+        assert result["current_entries"] == ["fact A", "fact B"]
+        assert "usage" in result
 
     def test_remove_requires_old_text(self, store):
+        store.add("memory", "fact A")
         result = json.loads(memory_tool(action="remove", store=store))
         assert result["success"] is False
+        assert "old_text" in result["error"]
+        assert result["current_entries"] == ["fact A"]
+        assert "usage" in result
+
+    def test_replace_missing_content_still_distinct_error(self, store):
+        # When old_text IS present but content is missing, keep the original
+        # content-specific error (don't route through the old_text recovery path).
+        store.add("memory", "fact A")
+        result = json.loads(memory_tool(action="replace", old_text="fact A", store=store))
+        assert result["success"] is False
+        assert "content is required" in result["error"]
+        assert "current_entries" not in result
 
 
 class TestMemoryBatch:
@@ -633,16 +733,30 @@ class TestExternalDriftGuard:
         assert Path(bak).exists()
         assert "Vendor Master" in Path(bak).read_text()
 
-    def test_add_refuses_on_drift(self, store):
-        store.add("memory", "Existing.")
-        path = self._plant_drift(store)
-        original = path.read_text()
+    def test_add_succeeds_despite_drift(self, store):
+        """Add (append) should succeed even when on-disk content shows drift.
+
+        The drift guard protects replace/remove from clobbering un-roundtrippable
+        content, but add only appends — it never overwrites existing entries.
+        Issue #42874: prior-session add() writes shift the byte count, causing
+        the round-trip check to fire on subsequent adds in the same session.
+        """
+        store.add("memory", "Existing entry.")
+        # Plant a mild drift: append content that won't round-trip but stays
+        # under the char limit (500 chars in test fixture).
+        path = store._path_for("memory")
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\nextra content no delimiter",
+            encoding="utf-8",
+        )
 
         result = store.add("memory", "New entry under drift.")
 
-        assert result["success"] is False
-        assert "drift_backup" in result
-        assert path.read_text() == original  # untouched
+        assert result["success"] is True
+        # The new entry is appended — existing drift content is preserved.
+        updated = path.read_text(encoding="utf-8")
+        assert "New entry under drift." in updated
+        assert "extra content no delimiter" in updated
 
     def test_remove_refuses_on_drift(self, store):
         store.add("memory", "Target entry to remove.")
@@ -697,12 +811,16 @@ class TestExternalDriftGuard:
         overwrite the first .bak. The current implementation accepts that
         — both files describe the same on-disk state — but pin the path
         format here so any future change has to think about it.
+
+        Note: add() no longer triggers drift detection (issue #42874) —
+        only replace/remove do.  Both r1 and r2 use replace/remove.
         """
         store.add("memory", "Initial.")
+        store.add("memory", "Second entry.")
         self._plant_drift(store)
 
         r1 = store.replace("memory", "Initial", "Replacement.")
-        r2 = store.add("memory", "Another.")
+        r2 = store.remove("memory", "Second entry")
         assert r1.get("drift_backup")
         assert r2.get("drift_backup")
         # Same epoch second is the expected collision case — both point

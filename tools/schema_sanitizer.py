@@ -71,29 +71,19 @@ def _sanitize_single_tool(tool: dict) -> dict:
     params = fn.get("parameters")
     # Missing / non-dict parameters → substitute the minimal valid shape.
     if not isinstance(params, dict):
-        fn["parameters"] = {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        }
+        fn["parameters"] = {"type": "object", "properties": {}}
         return out
 
     fn["parameters"] = _sanitize_node(params, path=fn.get("name", "<tool>"))
     # After recursion, guarantee the top-level is an object with properties.
     top = fn["parameters"]
     if not isinstance(top, dict):
-        fn["parameters"] = {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        }
+        fn["parameters"] = {"type": "object", "properties": {}}
     else:
         if top.get("type") != "object":
             top["type"] = "object"
         if "properties" not in top or not isinstance(top.get("properties"), dict):
             top["properties"] = {}
-        if "additionalProperties" not in top:
-            top["additionalProperties"] = False
     # Final pass: collapse nullable anyOf/oneOf unions that the recursive
     # sanitizer above leaves intact (it only handles the array-form
     # ``type: [X, "null"]``). Keep the ``nullable: true`` hint so runtime
@@ -245,7 +235,9 @@ def _sanitize_node(node: Any, path: str) -> Any:
       ``{"type": <value>}`` so downstream consumers see a dict.
     - Injects ``properties: {}`` into object-typed nodes missing it.
     - Normalizes ``type: [X, "null"]`` arrays to single ``type: X`` (keeping
-      ``nullable: true`` as a hint).
+      ``nullable: true`` as a hint), and multi-type arrays like
+      ``["number", "string"]`` to an ``anyOf`` of single-type schemas so no
+      branch is dropped (ported from anomalyco/opencode#31877).
     - Recurses into ``properties``, ``items``, ``additionalProperties``,
       ``anyOf``, ``oneOf``, ``allOf``, and ``$defs`` / ``definitions``.
     """
@@ -260,7 +252,6 @@ def _sanitize_node(node: Any, path: str) -> Any:
             return {"type": node} if node != "object" else {
                 "type": "object",
                 "properties": {},
-                "additionalProperties": False,
             }
         # Any other stray string is not a schema — drop it by replacing with
         # a permissive object schema rather than propagate something the
@@ -269,11 +260,7 @@ def _sanitize_node(node: Any, path: str) -> Any:
             "schema_sanitizer[%s]: replacing non-schema string %r "
             "with empty object schema", path, node,
         )
-        return {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        }
+        return {"type": "object", "properties": {}}
 
     if isinstance(node, list):
         return [_sanitize_node(item, f"{path}[{i}]") for i, item in enumerate(node)]
@@ -283,23 +270,39 @@ def _sanitize_node(node: Any, path: str) -> Any:
 
     out: dict = {}
     for key, value in node.items():
-        # type: [X, "null"] → type: X (the backend's tool-call parser only
-        # accepts singular string types; nullable is lost but the call still
-        # succeeds, and the model can still pass null on its own.)
+        # JSON Schema ``type`` arrays (e.g. ``["number", "string"]``, common
+        # in MCP tool schemas) are rejected by several tool-call backends:
+        #   * llama.cpp's grammar generator only accepts a singular string type.
+        #   * Gemini (including OpenAI-compatible transports such as GitHub
+        #     Copilot proxying to Gemini) rejects the array form outright —
+        #     plain @ai-sdk/google rewrites it, but the OpenAI-compatible path
+        #     forwards it verbatim and the backend 400s.
+        #
+        # Normalize per the SDK's behavior:
+        #   * single non-null type → ``type: X`` (+ ``nullable: true`` if the
+        #     array also contained "null"). No data lost.
+        #   * multiple non-null types → ``anyOf`` of single-type schemas, so
+        #     EVERY branch survives instead of silently dropping all but the
+        #     first. ``null`` is lifted into ``nullable: true``.
+        #   * all-null / empty → ``type: "null"`` (or object fallback).
+        # Ported from anomalyco/opencode#31877.
         if key == "type" and isinstance(value, list):
-            non_null = [t for t in value if t != "null"]
-            if len(non_null) == 1 and isinstance(non_null[0], str):
+            has_null = "null" in value
+            non_null = [t for t in value if isinstance(t, str) and t != "null"]
+            if len(non_null) == 1:
                 out["type"] = non_null[0]
-                if "null" in value:
+                if has_null:
                     out.setdefault("nullable", True)
                 continue
-            # Fallback: pick the first string type, drop the rest.
-            first_str = next((t for t in value if isinstance(t, str) and t != "null"), None)
-            if first_str:
-                out["type"] = first_str
+            if len(non_null) >= 2:
+                # Preserve all branches as a union instead of dropping them.
+                out["anyOf"] = [{"type": t} for t in non_null]
+                if has_null:
+                    out.setdefault("nullable", True)
                 continue
-            # All-null or empty list → treat as object.
-            out["type"] = "object"
+            # No usable non-null type: all-null array → type: "null";
+            # otherwise an empty/garbage array → object fallback.
+            out["type"] = "null" if has_null else "object"
             continue
 
         if key in {"properties", "$defs", "definitions"} and isinstance(value, dict):
@@ -336,8 +339,6 @@ def _sanitize_node(node: Any, path: str) -> Any:
     # llama.cpp's grammar generator can't constrain a free-form object.
     if out.get("type") == "object" and not isinstance(out.get("properties"), dict):
         out["properties"] = {}
-    if out.get("type") == "object" and "additionalProperties" not in out:
-        out["additionalProperties"] = False
 
     # Prune ``required`` entries that don't exist in properties (defense
     # against malformed MCP schemas; also caught upstream for MCP tools, but

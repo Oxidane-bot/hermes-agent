@@ -23,11 +23,7 @@ def _tool(name: str, parameters: dict) -> dict:
 def test_object_without_properties_gets_empty_properties():
     tools = [_tool("t", {"type": "object"})]
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
+    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}}
 
 
 def test_nested_object_without_properties_gets_empty_properties():
@@ -43,7 +39,6 @@ def test_nested_object_without_properties_gets_empty_properties():
     args = out[0]["function"]["parameters"]["properties"]["arguments"]
     assert args["type"] == "object"
     assert args["properties"] == {}
-    assert args["additionalProperties"] is False
     assert args["description"] == "free-form"
 
 
@@ -61,7 +56,6 @@ def test_bare_string_object_value_replaced_with_schema_dict():
     assert isinstance(payload, dict)
     assert payload["type"] == "object"
     assert payload["properties"] == {}
-    assert payload["additionalProperties"] is False
 
 
 def test_bare_string_primitive_value_replaced_with_schema_dict():
@@ -86,6 +80,65 @@ def test_nullable_type_array_collapsed_to_single_string():
     assert prop.get("nullable") is True
 
 
+def test_multitype_array_becomes_anyof_no_branch_dropped():
+    # Ported from anomalyco/opencode#31877: a genuine multi-type array such as
+    # ["number", "string"] (common in MCP tool schemas) must keep BOTH branches
+    # as an anyOf, not silently drop all but the first. Several backends
+    # (llama.cpp, Gemini via OpenAI-compatible transports) reject the array form.
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "status": {"type": ["number", "string"], "description": "status filter"},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["status"]
+    assert "type" not in prop
+    assert prop["anyOf"] == [{"type": "number"}, {"type": "string"}]
+    assert prop.get("nullable") is None
+    # Sibling keywords survive alongside the generated anyOf.
+    assert prop["description"] == "status filter"
+
+
+def test_multitype_array_with_null_lifts_nullable():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "v": {"type": ["integer", "boolean", "null"]},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["v"]
+    assert "type" not in prop
+    assert prop["anyOf"] == [{"type": "integer"}, {"type": "boolean"}]
+    assert prop.get("nullable") is True
+
+
+def test_all_null_type_array_becomes_null_type():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "n": {"type": ["null"]},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["n"]
+    assert prop["type"] == "null"
+
+
+def test_single_element_type_array_unwrapped():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "s": {"type": ["string"]},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["s"]
+    assert prop["type"] == "string"
+    assert prop.get("nullable") is None
+
+
 def test_anyof_nested_objects_sanitized():
     tools = [_tool("t", {
         "type": "object",
@@ -100,32 +153,20 @@ def test_anyof_nested_objects_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     variants = out[0]["function"]["parameters"]["properties"]["opt"]["anyOf"]
-    assert variants[0] == {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
+    assert variants[0] == {"type": "object", "properties": {}}
     assert variants[1] == {"type": "string"}
 
 
 def test_missing_parameters_gets_default_object_schema():
     tools = [{"type": "function", "function": {"name": "t"}}]
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
+    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}}
 
 
 def test_non_dict_parameters_gets_default_object_schema():
     tools = [_tool("t", "object")]  # pathological
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
+    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}}
 
 
 def test_required_pruned_to_existing_properties():
@@ -148,7 +189,7 @@ def test_required_all_missing_is_dropped():
     assert "required" not in out[0]["function"]["parameters"]
 
 
-def test_well_formed_schema_gets_default_additional_properties_false():
+def test_well_formed_schema_unchanged():
     schema = {
         "type": "object",
         "properties": {
@@ -159,10 +200,7 @@ def test_well_formed_schema_gets_default_additional_properties_false():
     }
     tools = [_tool("read_file", copy.deepcopy(schema))]
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {
-        **schema,
-        "additionalProperties": False,
-    }
+    assert out[0]["function"]["parameters"] == schema
 
 
 def test_additional_properties_bool_preserved():
@@ -193,11 +231,7 @@ def test_additional_properties_schema_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     field = out[0]["function"]["parameters"]["properties"]["dict_field"]
-    assert field["additionalProperties"] == {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
+    assert field["additionalProperties"] == {"type": "object", "properties": {}}
 
 
 def test_deepcopy_does_not_mutate_input():
@@ -223,37 +257,7 @@ def test_items_sanitized_in_array_schema():
     })]
     out = sanitize_tool_schemas(tools)
     items = out[0]["function"]["parameters"]["properties"]["bag"]["items"]
-    assert items == {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
-
-
-def test_explicit_false_additional_properties_is_preserved():
-    tools = [_tool("t", {
-        "type": "object",
-        "properties": {
-            "payload": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-        },
-    })]
-    out = sanitize_tool_schemas(tools)
-    payload = out[0]["function"]["parameters"]["properties"]["payload"]
-    assert payload["additionalProperties"] is False
-
-
-def test_top_level_non_object_coercion_adds_additional_properties_false():
-    tools = [_tool("t", {"type": "string"})]
-    out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
+    assert items == {"type": "object", "properties": {}}
 
 
 def test_ref_with_default_sibling_stripped():
