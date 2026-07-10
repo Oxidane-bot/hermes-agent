@@ -390,19 +390,38 @@ def run_dump(args):
     ]
 
     dotenv_keys = _dotenv_key_names()
+    tavily_dotenv_pool = any(
+        key in dotenv_keys
+        for key in ("TAVILY_API_KEY", "TAVILY_API_KEYS")
+    ) or any(
+        key.startswith("TAVILY_API_KEY_") and key[len("TAVILY_API_KEY_"):].isdigit()
+        for key in dotenv_keys
+    )
 
     for env_var, label in api_keys:
         val = os.getenv(env_var, "")
+        pool_summary = None
         if show_keys and val:
             display = _redact(val)
         else:
             display = "set" if val else "not set"
+        if label == "tavily":
+            try:
+                from plugins.web.tavily.provider import tavily_key_pool_summary
+
+                pool_summary = tavily_key_pool_summary()
+            except Exception:
+                pool_summary = None
+            if pool_summary:
+                display = pool_summary
+                if not tavily_dotenv_pool:
+                    display += " (shell only — not in .env; managed/desktop backend may not see it)"
         # Set in this (shell) process but absent from ~/.hermes/.env: a managed
         # backend (launchd/systemd/desktop `serve`) loads .env, not the login
         # shell, so it likely can't see this key — even though the dump reads
         # "set". Flag it so support doesn't chase a phantom "key is configured"
         # (the actual cause of gated tools like web_search going missing).
-        if val and env_var not in dotenv_keys:
+        if val and env_var not in dotenv_keys and not (pool_summary and tavily_dotenv_pool):
             display += " (shell only — not in .env; managed/desktop backend may not see it)"
         # A credential added via `hermes auth add openrouter` lives in the
         # credential pool, not as an env var — surface it so the dump doesn't

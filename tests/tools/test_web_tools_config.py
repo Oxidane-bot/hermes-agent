@@ -17,6 +17,15 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 
 
+def _is_numbered_tavily_api_key(name: str) -> bool:
+    return name.startswith("TAVILY_API_KEY_") and name.removeprefix("TAVILY_API_KEY_").isdigit()
+
+
+def _env_keys_with_numbered_tavily(base_keys):
+    yield from base_keys
+    yield from (name for name in list(os.environ) if _is_numbered_tavily_api_key(name))
+
+
 class TestFirecrawlClientConfig:
     """Test suite for Firecrawl client initialization."""
 
@@ -218,10 +227,11 @@ class TestBackendSelection:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "TAVILY_API_KEYS",
     )
 
     def setup_method(self):
-        for key in self._ENV_KEYS:
+        for key in _env_keys_with_numbered_tavily(self._ENV_KEYS):
             os.environ.pop(key, None)
         self._managed_patchers = [
             patch("tools.web_tools.managed_nous_tools_enabled", return_value=True),
@@ -231,7 +241,7 @@ class TestBackendSelection:
             p.start()
 
     def teardown_method(self):
-        for key in self._ENV_KEYS:
+        for key in _env_keys_with_numbered_tavily(self._ENV_KEYS):
             os.environ.pop(key, None)
         for p in self._managed_patchers:
             p.stop()
@@ -314,6 +324,13 @@ class TestBackendSelection:
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
             assert _get_backend() == "tavily"
 
+    def test_fallback_tavily_plural_only_key_pool(self):
+        """Plural Tavily keys alone should make Tavily auto-select."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"TAVILY_API_KEYS": '["tvly-a","tvly-b"]'}):
+            assert _get_backend() == "tavily"
+
     def test_fallback_tavily_beats_firecrawl_direct(self):
         """Tavily ranks above firecrawl in the explicit-credential block."""
         from tools.web_tools import _get_backend
@@ -367,6 +384,14 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch("tools.web_tools._is_tool_gateway_ready", return_value=True), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
+            assert _get_backend() == "tavily"
+
+    def test_managed_gateway_does_not_preempt_explicit_tavily_plural_pool(self):
+        """Plural Tavily keys must outrank the managed gateway convenience path."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=True), \
+             patch.dict(os.environ, {"TAVILY_API_KEYS": "tvly-a,tvly-b"}):
             assert _get_backend() == "tavily"
 
     def test_managed_gateway_only_falls_through_to_firecrawl(self):
@@ -540,10 +565,11 @@ class TestCheckWebApiKey:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "TAVILY_API_KEYS",
     )
 
     def setup_method(self):
-        for key in self._ENV_KEYS:
+        for key in _env_keys_with_numbered_tavily(self._ENV_KEYS):
             os.environ.pop(key, None)
         self._managed_patchers = [
             patch("tools.web_tools.managed_nous_tools_enabled", return_value=True),
@@ -561,7 +587,7 @@ class TestCheckWebApiKey:
             p.start()
 
     def teardown_method(self):
-        for key in self._ENV_KEYS:
+        for key in _env_keys_with_numbered_tavily(self._ENV_KEYS):
             os.environ.pop(key, None)
         for p in self._managed_patchers:
             p.stop()
@@ -719,6 +745,7 @@ class TestNonBuiltinProviderAvailability:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "TAVILY_API_KEYS",
         "SEARXNG_URL",
         "BRAVE_SEARCH_API_KEY",
         "XAI_API_KEY",
@@ -752,7 +779,7 @@ class TestNonBuiltinProviderAvailability:
 
     def setup_method(self):
         """Strip all built-in web provider env vars and reset the registry."""
-        for key in self._WEB_ENV_KEYS:
+        for key in _env_keys_with_numbered_tavily(self._WEB_ENV_KEYS):
             os.environ.pop(key, None)
         from agent.web_search_registry import _reset_for_tests, register_provider
         _reset_for_tests()
@@ -762,7 +789,7 @@ class TestNonBuiltinProviderAvailability:
         """Reset the registry and restore env after each test."""
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
-        for key in self._WEB_ENV_KEYS:
+        for key in _env_keys_with_numbered_tavily(self._WEB_ENV_KEYS):
             os.environ.pop(key, None)
 
     def test_check_web_api_key_returns_true_for_custom_provider(self):

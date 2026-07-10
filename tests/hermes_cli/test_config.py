@@ -1123,6 +1123,30 @@ class TestOptionalEnvVarsRegistry:
         assert "HERMES_MAX_ITERATIONS" not in OPTIONAL_ENV_VARS
 
 
+def test_show_config_reports_tavily_numbered_pool_without_key_value(
+    monkeypatch, capsys, tmp_path
+):
+    import hermes_cli.config as config_mod
+
+    sentinel = "TAVILY_NUMBERED_SECRET_DO_NOT_PRINT"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(config_mod, "load_config", lambda: DEFAULT_CONFIG.copy())
+
+    def _env_value(name):
+        return {"TAVILY_API_KEY_1": sentinel}.get(name)
+
+    monkeypatch.setattr(config_mod, "get_env_value", _env_value)
+
+    config_mod.show_config()
+
+    output = capsys.readouterr().out
+    tavily_line = next(line for line in output.splitlines() if "Tavily" in line)
+    assert "pool" in tavily_line
+    assert "1 key" in tavily_line
+    assert sentinel not in output
+
+
 class TestMemoryProviderEnvVarsRegistry:
     """Every memory provider that reads an API key from the environment must
     have that key catalogued in OPTIONAL_ENV_VARS so the dashboard Keys page

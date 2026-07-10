@@ -176,6 +176,21 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+def _resolve_fallback_entry_api_key(entry: dict[str, Any]) -> str:
+    """Return an explicit API key for a configured fallback entry, if any."""
+    api_key = str(entry.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+    for hint_key in ("key_env", "api_key_env"):
+        env_name = str(entry.get(hint_key) or "").strip()
+        if not env_name:
+            continue
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
@@ -3159,7 +3174,8 @@ def run_job(
         # off-host call is ever made with a stored key.
         _guard_job_credential_exfil(job)
 
-        primary_model_for_drift = model
+        selected_fallback_index: int | None = None
+        primary_model_for_drift = str(model or "").strip()
         configured_provider_for_drift = (
             str(_model_cfg.get("provider") or "").strip().lower()
             if isinstance(_model_cfg, dict)
@@ -3168,6 +3184,7 @@ def run_job(
         primary_provider_for_drift = (
             str(job.get("provider") or "").strip().lower()
             or configured_provider_for_drift
+            or os.getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower()
             or None
         )
         try:
@@ -3202,7 +3219,7 @@ def run_job(
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
             fb_list = get_fallback_chain(_cfg)
             runtime = None
-            for entry in fb_list:
+            for index, entry in enumerate(fb_list):
                 if not isinstance(entry, dict):
                     continue
                 fb_provider = str(entry.get("provider") or "").strip()
@@ -3223,6 +3240,7 @@ def run_job(
                         fb_kwargs["explicit_api_key"] = fb_api_key
                     runtime = resolve_runtime_provider(**fb_kwargs)
                     model = fb_model
+                    selected_fallback_index = index
                     logger.info(
                         "Job '%s': fallback resolved to %s model %s",
                         job_id,
@@ -3298,7 +3316,10 @@ def run_job(
                 f"(or pin the original values to keep them). See #44585."
             )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_chain = get_fallback_chain(_cfg)
+        if selected_fallback_index is not None:
+            fallback_chain = fallback_chain[selected_fallback_index + 1:]
+        fallback_model = fallback_chain or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:

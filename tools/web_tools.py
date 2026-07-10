@@ -61,6 +61,7 @@ from plugins.web.firecrawl.provider import (
 # Tavily helpers re-exported for backward-compat with existing unit tests
 # (tests/tools/test_web_tools_tavily.py imports these names directly).
 from plugins.web.tavily.provider import (  # noqa: F401 — backward-compat names
+    _get_tavily_api_keys,
     _normalize_tavily_documents,
     _normalize_tavily_search_results,
     _tavily_request,
@@ -239,7 +240,7 @@ def _get_backend() -> str:
     # with "no subscription" and the tool returns an error to the agent
     # without falling back). Free-tier backends trail the paid ones.
     backend_candidates = (
-        ("tavily", _has_env("TAVILY_API_KEY")),
+        ("tavily", _is_backend_available("tavily")),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
@@ -332,7 +333,10 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "firecrawl":
         return check_firecrawl_api_key()
     if backend == "tavily":
-        return _has_env("TAVILY_API_KEY")
+        registered = _registered_web_provider_available("tavily")
+        if registered is not None:
+            return registered
+        return bool(_get_tavily_api_keys())
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 
 import pytest
 
@@ -31,10 +32,11 @@ import pytest
 
 def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip every web-provider env var so is_available() returns False."""
-    for k in (
+    keys = [
         "BRAVE_SEARCH_API_KEY",
         "SEARXNG_URL",
         "TAVILY_API_KEY",
+        "TAVILY_API_KEYS",
         "TAVILY_BASE_URL",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
@@ -45,7 +47,13 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
-    ):
+    ]
+    keys.extend(
+        name
+        for name in list(os.environ)
+        if name.startswith("TAVILY_API_KEY_") and name.removeprefix("TAVILY_API_KEY_").isdigit()
+    )
+    for k in keys:
         monkeypatch.delenv(k, raising=False)
 
 
@@ -181,6 +189,20 @@ class TestIsAvailable:
         assert p.is_available() is False
         monkeypatch.setenv("TAVILY_API_KEY", "real")
         assert p.is_available() is True
+
+    def test_tavily_setup_schema_mentions_key_pool_inputs(self) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("tavily")
+        assert p is not None
+
+        env_keys = {
+            entry["key"]
+            for entry in p.get_setup_schema()["env_vars"]
+            if isinstance(entry, dict)
+        }
+        assert {"TAVILY_API_KEY", "TAVILY_API_KEYS", "TAVILY_API_KEY_1"} <= env_keys
 
     def test_exa_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _ensure_plugins_loaded()

@@ -8343,7 +8343,15 @@ def show_config():
     
     for env_key, name in keys:
         value = get_env_value(env_key)
-        print(f"  {name:<14} {redact_key(value)}")
+        display = redact_key(value)
+        if env_key == "TAVILY_API_KEY":
+            try:
+                from plugins.web.tavily.provider import tavily_key_pool_summary
+
+                display = tavily_key_pool_summary() or display
+            except Exception:
+                pass
+        print(f"  {name:<14} {display}")
     from hermes_cli.auth import get_anthropic_key
     anthropic_value = get_anthropic_key()
     print(f"  {'Anthropic':<14} {redact_key(anthropic_value)}")

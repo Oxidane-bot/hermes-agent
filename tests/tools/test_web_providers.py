@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List
 
 import pytest
@@ -278,17 +279,24 @@ class TestUnconfiguredErrorEnvelopeParity:
         _reset_for_tests()
 
     def _clear_web_creds(self, monkeypatch):
-        for k in (
+        keys = [
             "BRAVE_SEARCH_API_KEY",
             "SEARXNG_URL",
             "TAVILY_API_KEY",
+            "TAVILY_API_KEYS",
             "EXA_API_KEY",
             "PARALLEL_API_KEY",
             "FIRECRAWL_API_KEY",
             "FIRECRAWL_API_URL",
             "FIRECRAWL_GATEWAY_URL",
             "TOOL_GATEWAY_DOMAIN",
-        ):
+        ]
+        keys.extend(
+            name
+            for name in list(os.environ)
+            if name.startswith("TAVILY_API_KEY_") and name.removeprefix("TAVILY_API_KEY_").isdigit()
+        )
+        for k in keys:
             monkeypatch.delenv(k, raising=False)
 
     def test_unconfigured_search_emits_top_level_error(self, monkeypatch):
@@ -412,6 +420,14 @@ class TestDispatchersTriggerPluginDiscovery:
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},
             )
+
+            async def _safe_url(_url: str) -> bool:
+                return True
+
+            # This regression covers plugin discovery, not DNS/SSRF policy.
+            # Keep its URL fixture independent of resolver mappings in the
+            # test environment (for example, example.com → a reserved range).
+            monkeypatch.setattr(web_tools, "async_is_safe_url", _safe_url)
             # Sanity: registry IS empty before the tool call.
             assert web_search_registry.get_provider("firecrawl") is None
 
@@ -582,6 +598,13 @@ class TestDisabledPluginDiagnostic:
             self._patch_manager(monkeypatch, {
                 "web/firecrawl": self._FakeLoaded(False, "disabled via config"),
             })
+
+            async def _safe_url(_url: str) -> bool:
+                return True
+
+            # Exercise the disabled-plugin diagnostic independently from the
+            # environment's DNS/SSRF policy.
+            monkeypatch.setattr(web_tools, "async_is_safe_url", _safe_url)
             result = json.loads(
                 asyncio.new_event_loop().run_until_complete(
                     web_tools.web_extract_tool(["https://example.com"])
@@ -621,4 +644,3 @@ class TestDisabledPluginDiagnostic:
             assert "No web search provider configured" not in err
         finally:
             restore()
-

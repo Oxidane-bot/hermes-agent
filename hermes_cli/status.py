@@ -179,6 +179,16 @@ def show_status(args):
         value = _resolve_env(env_ref)
         has_key = bool(value)
         display = redact_key(value)
+        if name == "Tavily":
+            try:
+                from plugins.web.tavily.provider import tavily_key_pool_summary
+
+                pool_summary = tavily_key_pool_summary()
+            except Exception:
+                pool_summary = None
+            if pool_summary:
+                has_key = True
+                display = pool_summary
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
 
     from hermes_cli.auth import get_anthropic_key
