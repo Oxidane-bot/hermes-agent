@@ -2265,10 +2265,8 @@ class BasePlatformAdapter(ABC):
     # ``format_message`` translates/preserves markdown fences into a real code
     # block).  Capability flag for markdown-aware presentation choices.
     # Default False (plain-text platforms); markdown-rendering adapters set True.
-    # Tool-progress uses this to render a terminal command as a bare fenced code
-    # block (no language tag — Slack mrkdwn would print the tag as a literal
-    # first code line).  Plain-text platforms fall back to the short truncated
-    # preview (see gateway/run.py progress_callback).
+    # This describes platform rendering capability only. Tool-progress remains
+    # compact text and does not reinterpret terminal commands as message blocks.
     supports_code_blocks: bool = False
 
     # Whether this adapter can deliver an ASYNC notification back to the agent
