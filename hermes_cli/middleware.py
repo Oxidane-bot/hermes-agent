@@ -231,6 +231,13 @@ def _has_middleware(kind: str) -> bool:
     return has_middleware(kind)
 
 
+def llm_payload_middleware_active() -> bool:
+    """Return whether middleware may replace the provider request payload."""
+    return _has_middleware(LLM_REQUEST_MIDDLEWARE) or _has_middleware(
+        LLM_EXECUTION_MIDDLEWARE
+    )
+
+
 def _get_middleware_callbacks(kind: str) -> List[Callable]:
     from hermes_cli.plugins import get_plugin_manager
 
