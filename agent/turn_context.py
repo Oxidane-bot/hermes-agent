@@ -34,8 +34,11 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.model_metadata import (
+    build_request_continuity_marker,
     estimate_messages_tokens_rough,
+    estimate_request_growth_upper_bound,
     estimate_request_tokens_rough,
+    request_contains_images,
 )
 
 logger = logging.getLogger(__name__)
@@ -275,6 +278,7 @@ def build_turn_context(
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
     *,
+    replaceable_payload_context: bool = False,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -576,7 +580,52 @@ def build_turn_context(
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
         )
+        _preflight_growth_upper_bound = estimate_request_growth_upper_bound(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
+        _preflight_continuity_marker = build_request_continuity_marker(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
+        try:
+            from hermes_cli.middleware import llm_payload_middleware_active
+            from hermes_cli.plugins import has_hook
+
+            _replaceable_context_possible = bool(
+                replaceable_payload_context
+                or getattr(agent, "_memory_manager", None)
+                or getattr(agent, "ephemeral_system_prompt", None)
+                or getattr(agent, "prefill_messages", None)
+                or has_hook("pre_llm_call")
+            )
+            _calibration_allowed = (
+                bool(_preflight_continuity_marker)
+                and not request_contains_images(messages)
+                and not (
+                    llm_payload_middleware_active()
+                    or _replaceable_context_possible
+                )
+            )
+        except Exception:
+            _calibration_allowed = False
         _compressor = agent.context_compressor
+        _prepare_continuity = getattr(
+            _compressor, "prepare_preflight_continuity_marker", None
+        )
+        if callable(_prepare_continuity):
+            _prepare_continuity(_preflight_continuity_marker)
+        _prepare_calibration = getattr(
+            _compressor, "prepare_preflight_calibration", None
+        )
+        if callable(_prepare_calibration):
+            _prepare_calibration(
+                rough_tokens=_preflight_tokens,
+                growth_upper_bound=_preflight_growth_upper_bound,
+                calibration_allowed=_calibration_allowed,
+            )
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",
@@ -613,7 +662,8 @@ def build_turn_context(
         if _preflight_deferred:
             logger.info(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
-                "but last real provider prompt was %s after compression",
+                "but calibration from the last real provider prompt (%s) "
+                "keeps the current estimate below threshold",
                 f"{_preflight_tokens:,}",
                 f"{_compressor.threshold_tokens:,}",
                 f"{_compressor.last_real_prompt_tokens:,}",

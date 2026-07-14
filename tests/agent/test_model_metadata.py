@@ -30,7 +30,10 @@ from agent.model_metadata import (
     save_context_length,
     fetch_model_metadata,
     _MODEL_CACHE_TTL,
+    estimate_request_growth_upper_bound,
     estimate_request_tokens_rough,
+    build_request_continuity_marker,
+    request_contains_images,
 )
 
 
@@ -122,6 +125,212 @@ class TestEstimateMessagesTokensRough:
 
 
 class TestEstimateRequestTokensRough:
+    def test_detects_images_that_make_calibration_ineligible(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ]
+
+        assert request_contains_images(messages) is True
+        assert request_contains_images([{"role": "user", "content": "text"}]) is False
+
+    def test_growth_upper_bound_counts_utf8_bytes_for_token_dense_text(self):
+        dense = "汉" * 8_000
+        messages = [{"role": "user", "content": dense}]
+
+        rough = estimate_request_tokens_rough(messages)
+        upper = estimate_request_growth_upper_bound(messages)
+
+        assert upper >= len(dense.encode("utf-8"))
+        assert upper > rough * 4
+
+    def test_tools_cache_invalidates_when_middle_schema_changes_in_place(self):
+        import agent.model_metadata as mm
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{index}",
+                    "description": "short",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for index in range(3)
+        ]
+        messages = [{"role": "user", "content": "hello"}]
+        mm._TOOLS_TOKENS_CACHE.clear()
+        mm._TOOLS_GROWTH_CACHE.clear()
+        rough_before = estimate_request_tokens_rough(messages, tools=tools)
+        upper_before = estimate_request_growth_upper_bound(messages, tools=tools)
+
+        tools[1]["function"]["description"] = "汉" * 100_000
+
+        rough_after = estimate_request_tokens_rough(messages, tools=tools)
+        upper_after = estimate_request_growth_upper_bound(messages, tools=tools)
+
+        assert rough_after > rough_before
+        assert upper_after > upper_before
+
+        tools[1]["function"]["parameters"]["properties"]["payload"] = {
+            "type": "string",
+            "description": "汉" * 100_000,
+        }
+
+        assert estimate_request_tokens_rough(messages, tools=tools) > rough_after
+        assert estimate_request_growth_upper_bound(messages, tools=tools) > upper_after
+
+    def test_tools_cache_invalidates_for_python_hash_collisions(self):
+        import sys
+        import agent.model_metadata as mm
+
+        colliding_int = 1 + sys.hash_info.modulus * (10**2_980)
+        assert colliding_int != 1
+        assert hash(colliding_int) == hash(1)
+        properties = {
+            f"field_{index}": {"type": "integer", "maximum": 1}
+            for index in range(80)
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "collision_probe",
+                    "description": "probe",
+                    "parameters": {"type": "object", "properties": properties},
+                },
+            }
+        ]
+        messages = [{"role": "user", "content": "hello"}]
+        mm._TOOLS_TOKENS_CACHE.clear()
+        mm._TOOLS_GROWTH_CACHE.clear()
+        rough_before = estimate_request_tokens_rough(messages, tools=tools)
+        upper_before = estimate_request_growth_upper_bound(messages, tools=tools)
+
+        for schema in properties.values():
+            schema["maximum"] = colliding_int
+
+        assert estimate_request_tokens_rough(messages, tools=tools) > rough_before
+        assert estimate_request_growth_upper_bound(messages, tools=tools) > upper_before
+
+    def test_tools_cache_invalidates_for_signed_zero_float_changes(self):
+        import agent.model_metadata as mm
+
+        properties = {
+            f"field_{index}": {"type": "number", "maximum": 0.0}
+            for index in range(120)
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "signed_zero_probe",
+                    "description": "probe",
+                    "parameters": {"type": "object", "properties": properties},
+                },
+            }
+        ]
+        messages = [{"role": "user", "content": "hello"}]
+        mm._TOOLS_TOKENS_CACHE.clear()
+        mm._TOOLS_GROWTH_CACHE.clear()
+        rough_before = estimate_request_tokens_rough(messages, tools=tools)
+        upper_before = estimate_request_growth_upper_bound(messages, tools=tools)
+
+        for schema in properties.values():
+            schema["maximum"] = -0.0
+
+        rough_cached = estimate_request_tokens_rough(messages, tools=tools)
+        upper_cached = estimate_request_growth_upper_bound(messages, tools=tools)
+        mm._TOOLS_TOKENS_CACHE.clear()
+        mm._TOOLS_GROWTH_CACHE.clear()
+        rough_fresh = estimate_request_tokens_rough(messages, tools=tools)
+        upper_fresh = estimate_request_growth_upper_bound(messages, tools=tools)
+
+        assert rough_cached == rough_fresh > rough_before
+        assert upper_cached == upper_fresh > upper_before
+
+    def test_equal_size_tool_replacement_changes_continuity_marker(self):
+        messages = [{"role": "user", "content": "hello"}]
+        tools_a = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "汉" * 100_000,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        tools_b = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "龘" * 100_000,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        assert estimate_request_tokens_rough(messages, tools=tools_a) == (
+            estimate_request_tokens_rough(messages, tools=tools_b)
+        )
+        assert estimate_request_growth_upper_bound(messages, tools=tools_a) == (
+            estimate_request_growth_upper_bound(messages, tools=tools_b)
+        )
+        assert build_request_continuity_marker(messages, tools=tools_a) != (
+            build_request_continuity_marker(messages, tools=tools_b)
+        )
+
+    def test_lone_surrogate_and_question_mark_have_distinct_markers(self):
+        messages = [{"role": "user", "content": "hello"}]
+        surrogate_tool = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "probe",
+                    "description": "\ud800" * 10_000,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        question_tool = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "probe",
+                    "description": "?" * 10_000,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        assert build_request_continuity_marker(messages, tools=surrogate_tool) != (
+            build_request_continuity_marker(messages, tools=question_tool)
+        )
+
+    def test_tool_key_reordering_changes_continuity_marker(self):
+        messages = [{"role": "user", "content": "hello"}]
+        function = {
+            "name": "probe",
+            "description": "same",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        tools_a = [{"type": "function", "function": function}]
+        tools_b = [{"function": function, "type": "function"}]
+
+        assert build_request_continuity_marker(messages, tools=tools_a) != (
+            build_request_continuity_marker(messages, tools=tools_b)
+        )
+
     def test_caches_tools_estimate(self):
         messages = [{"role": "user", "content": "hello"}]
         tools = [
@@ -165,8 +374,11 @@ class TestEstimateRequestTokensRough:
             ]
             held.append(tools)
             mm._estimate_tools_tokens_rough(tools)
+            mm._estimate_tools_growth_upper_bound(tools)
             assert len(mm._TOOLS_TOKENS_CACHE) <= cap
+            assert len(mm._TOOLS_GROWTH_CACHE) <= cap
         assert len(mm._TOOLS_TOKENS_CACHE) == cap
+        assert len(mm._TOOLS_GROWTH_CACHE) == cap
 
 
 # =========================================================================

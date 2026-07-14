@@ -402,6 +402,16 @@ def test_between_turns_refresh_no_churn_when_unchanged():
     assert agent.tools is same  # not replaced → no churn
 
 
+def test_replaceable_payload_context_disables_preflight_calibration(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        _build(agent, replaceable_payload_context=True)
+
+    assert agent.context_compressor._preflight_calibration_allowed is False
+
+
 def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
     agent = _make_agent_with_cooldown(
         tmp_path / "state.db",

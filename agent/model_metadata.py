@@ -4,6 +4,7 @@ Pure utility functions with no AIAgent dependency. Used by ContextCompressor
 and run_agent.py for pre-flight context checks.
 """
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -2652,14 +2653,24 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
+def request_contains_images(messages: List[Dict[str, Any]]) -> bool:
+    """Return True when request messages contain any image payload."""
+    return any(_count_image_tokens(message, 1) > 0 for message in messages or [])
+
+
 def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     """Char count for token estimation, excluding base64 image data.
 
     Base64 images are counted via `_count_image_tokens` instead; including
     their raw chars here would massively overestimate token usage.
     """
+    return len(str(_message_estimation_shadow(msg)))
+
+
+def _message_estimation_shadow(msg: Dict[str, Any]) -> Any:
+    """Return the text-sized form of a message with image bytes removed."""
     if not isinstance(msg, dict):
-        return len(str(msg))
+        return msg
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
         if k == "_anthropic_content_blocks":
@@ -2682,7 +2693,72 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
                 shadow[k] = v
         else:
             shadow[k] = v
-    return len(str(shadow))
+    return shadow
+
+
+def _canonical_payload_digest(value: Any) -> Optional[str]:
+    """Return a stable SHA-256 digest for JSON-shaped provider payload data."""
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_request_continuity_marker(
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """Fingerprint static tools and the ordered request-message prefix.
+
+    Calibration is safe only when tools are identical and the current request
+    extends the exact message prefix that produced the provider-usage baseline.
+    SHA-256 avoids Python's deterministic equality/hash collisions while keeping
+    the retained baseline small even for very long conversations.
+    """
+    tool_digest = _canonical_payload_digest(tools or [])
+    if tool_digest is None:
+        return None
+    request_messages: List[Any] = []
+    if system_prompt:
+        request_messages.append({"role": "system", "content": system_prompt})
+    request_messages.extend(messages or [])
+    message_digests = []
+    for message in request_messages:
+        digest = _canonical_payload_digest(message)
+        if digest is None:
+            return None
+        message_digests.append(digest)
+    return tool_digest, tuple(message_digests)
+
+
+def estimate_request_growth_upper_bound(
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Conservative metric for token growth between adjacent requests.
+
+    UTF-8 byte length bounds token-dense Unicode more safely than the normal
+    four-characters-per-token estimate. This value is intended for deltas from
+    a provider-reported baseline, not as an absolute prompt-token count.
+    """
+    image_growth_cost = 8192
+    total = len(system_prompt.encode("utf-8", errors="replace"))
+    for msg in messages or []:
+        shadow = _message_estimation_shadow(msg)
+        total += len(str(shadow).encode("utf-8", errors="replace"))
+        total += _count_image_tokens(msg, image_growth_cost)
+    if tools:
+        total += _estimate_tools_growth_upper_bound(tools)
+    return total
 
 
 def estimate_request_tokens_rough(
@@ -2712,24 +2788,68 @@ def estimate_request_tokens_rough(
 # NOTE: tool schemas can be large. Avoid repeated `str(tools)` conversions,
 # which are CPU-heavy and can stall GUI event loops under GIL pressure.
 #
-# Keyed by ``id(tools)``. A long-lived gateway/desktop backend builds many
-# transient tool lists over its lifetime, so the cache is bounded and evicts
-# oldest-first (insertion-ordered dict) once it exceeds the cap. The cap is
-# generous relative to how rarely toolsets are rebuilt within a process.
-_TOOLS_TOKENS_CACHE: dict[int, Tuple[int, str, str, int]] = {}
-_TOOLS_TOKENS_CACHE_MAX = 256
+# Keyed by ``id(tools)`` and validated by an exact structural snapshot. A
+# long-lived gateway/desktop backend builds many transient tool lists over its
+# lifetime, so the cache is bounded and evicts oldest-first
+# (insertion-ordered dict) once it exceeds the cap.
+# Each entry keeps the root list alive, preventing ``id()`` reuse while cached.
+# The cap is intentionally small because exact snapshots retain schema objects.
+_TOOLS_TOKENS_CACHE: dict[int, Tuple[List[Dict[str, Any]], Any, int]] = {}
+_TOOLS_GROWTH_CACHE: dict[int, Tuple[List[Dict[str, Any]], Any, int]] = {}
+_TOOLS_TOKENS_CACHE_MAX = 16
 
 
-def _tool_name_for_cache(tool: Any) -> str:
-    if not isinstance(tool, dict):
-        return ""
-    fn = tool.get("function")
-    if isinstance(fn, dict):
-        name = fn.get("name")
-        if isinstance(name, str):
-            return name
-    name = tool.get("name")
-    return name if isinstance(name, str) else ""
+def _schema_version_snapshot(value: Any, active: Optional[set[int]] = None) -> Any:
+    """Return an exact mutation-sensitive snapshot for JSON-shaped schemas.
+
+    Immutable leaves are retained by reference and compared by value; container
+    identities and ordered children capture replacement, reordering, and nested
+    in-place edits. No lossy hash decides cache validity.
+    """
+    if active is None:
+        active = set()
+    if isinstance(value, dict):
+        object_id = id(value)
+        if object_id in active:
+            return ("cycle", object_id)
+        active.add(object_id)
+        snapshot = (
+            "dict",
+            object_id,
+            tuple(
+                (
+                    _schema_version_snapshot(key, active),
+                    _schema_version_snapshot(child, active),
+                )
+                for key, child in value.items()
+            ),
+        )
+        active.remove(object_id)
+        return snapshot
+    if isinstance(value, (list, tuple)):
+        object_id = id(value)
+        if object_id in active:
+            return ("cycle", object_id)
+        active.add(object_id)
+        snapshot = (
+            type(value).__name__,
+            object_id,
+            tuple(_schema_version_snapshot(child, active) for child in value),
+        )
+        active.remove(object_id)
+        return snapshot
+    if isinstance(value, (str, bytes)):
+        return (type(value).__name__, id(value), value)
+    if isinstance(value, float):
+        # ``0.0 == -0.0`` in Python, but JSON preserves the sign and therefore
+        # changes both cached payload metrics. ``float.hex`` distinguishes
+        # signed zero and provides a stable exact form for finite values.
+        return ("float", value.hex())
+    if value is None or isinstance(value, (bool, int)):
+        return (type(value).__name__, value)
+    # Tool schemas should be JSON-shaped. An unknown mutable object is not
+    # verifiable without invoking arbitrary user code, so force a cache miss.
+    return (type(value).__name__, id(value), object())
 
 
 def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
@@ -2739,14 +2859,12 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
     # Cache by list identity. Tools are rebuilt rarely (toolset changes),
     # but token estimates are requested frequently (preflight, compaction).
     key = id(tools)
-    n = len(tools)
-    first = _tool_name_for_cache(tools[0]) if n else ""
-    last = _tool_name_for_cache(tools[-1]) if n else ""
+    snapshot = _schema_version_snapshot(tools)
 
     cached = _TOOLS_TOKENS_CACHE.get(key)
     if cached is not None:
-        cached_n, cached_first, cached_last, cached_tokens = cached
-        if cached_n == n and cached_first == first and cached_last == last:
+        cached_tools, cached_snapshot, cached_tokens = cached
+        if cached_tools is tools and cached_snapshot == snapshot:
             return cached_tokens
 
     # Fast, stable rough estimate: sum lengths of the major schema fields.
@@ -2782,5 +2900,32 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
     # ``id(tools)`` entries (id values are recycled after GC anyway).
     if len(_TOOLS_TOKENS_CACHE) >= _TOOLS_TOKENS_CACHE_MAX:
         _TOOLS_TOKENS_CACHE.pop(next(iter(_TOOLS_TOKENS_CACHE)), None)
-    _TOOLS_TOKENS_CACHE[key] = (n, first, last, tokens)
+    _TOOLS_TOKENS_CACHE[key] = (tools, snapshot, tokens)
     return tokens
+
+
+def _estimate_tools_growth_upper_bound(tools: List[Dict[str, Any]]) -> int:
+    """UTF-8 byte metric for tool-schema growth, cached by tool-list identity."""
+    if not tools:
+        return 0
+
+    key = id(tools)
+    snapshot = _schema_version_snapshot(tools)
+    cached = _TOOLS_GROWTH_CACHE.get(key)
+    if cached is not None:
+        cached_tools, cached_snapshot, cached_upper = cached
+        if cached_tools is tools and cached_snapshot == snapshot:
+            return cached_upper
+
+    total = 0
+    for tool in tools:
+        try:
+            text = json.dumps(tool, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            text = str(tool)
+        total += len(text.encode("utf-8", errors="replace"))
+
+    if len(_TOOLS_GROWTH_CACHE) >= _TOOLS_TOKENS_CACHE_MAX:
+        _TOOLS_GROWTH_CACHE.pop(next(iter(_TOOLS_GROWTH_CACHE)), None)
+    _TOOLS_GROWTH_CACHE[key] = (tools, snapshot, total)
+    return total

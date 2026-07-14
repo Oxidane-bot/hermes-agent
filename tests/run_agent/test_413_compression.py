@@ -820,10 +820,110 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         assert result["completed"] is True
         assert result["final_response"] == "Used real fit"
+        assert agent.context_compressor.last_request_rough_tokens == 114_000
+        assert agent.context_compressor.last_request_growth_upper_bound > 0
         assert not any(
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages
         )
+
+    def test_preflight_does_not_calibrate_across_payload_middleware(self, agent):
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.last_prompt_tokens = 58_000
+        agent.context_compressor.last_real_prompt_tokens = 58_000
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        agent.context_compressor.last_compression_rough_tokens = 113_000
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message {i} padded"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded"})
+
+        ok_resp = _mock_response(
+            content="Middleware-safe compression",
+            finish_reason="stop",
+            usage={"prompt_tokens": 40_000, "completion_tokens": 100, "total_tokens": 40_100},
+        )
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+        rough_calls = {"n": 0}
+
+        def _rough_estimate(*_args, **_kwargs):
+            rough_calls["n"] += 1
+            return 114_000 if rough_calls["n"] == 1 else 40_000
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch(
+                "hermes_cli.middleware.llm_payload_middleware_active",
+                return_value=True,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
+                "new system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+        assert agent.context_compressor.last_request_rough_tokens == 0
+        assert agent.context_compressor.last_rough_tokens_when_real_prompt_fit == 0
+        assert agent.context_compressor.last_compression_rough_tokens == 0
+
+    def test_preflight_does_not_calibrate_across_ephemeral_memory_context(self, agent):
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.last_prompt_tokens = 58_000
+        agent.context_compressor.last_real_prompt_tokens = 58_000
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        agent.context_compressor.last_compression_rough_tokens = 113_000
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.prefetch_all.return_value = "ephemeral recall context"
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message {i} padded"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded"})
+
+        ok_resp = _mock_response(
+            content="Ephemeral-safe compression",
+            finish_reason="stop",
+            usage={"prompt_tokens": 40_000, "completion_tokens": 100, "total_tokens": 40_100},
+        )
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+        rough_calls = {"n": 0}
+
+        def _rough_estimate(*_args, **_kwargs):
+            rough_calls["n"] += 1
+            return 114_000 if rough_calls["n"] == 1 else 40_000
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
+                "new system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+        assert agent.context_compressor.last_request_rough_tokens == 0
+        assert agent.context_compressor.last_rough_tokens_when_real_prompt_fit == 0
+        assert agent.context_compressor.last_compression_rough_tokens == 0
 
     def test_preflight_compresses_when_rough_growth_after_fit_is_large(self, agent):
         """Large rough growth after a fitting request still triggers preflight."""

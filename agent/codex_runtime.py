@@ -239,6 +239,9 @@ def _record_codex_app_server_compaction(
             record_boundary(compressor, used_fallback=False)
         elif hasattr(compressor, "_verify_compaction_cleared_threshold"):
             compressor._verify_compaction_cleared_threshold = True
+        compressor.last_compression_continuity_marker = getattr(
+            compressor, "_preflight_continuity_marker", None
+        )
         if not getattr(turn, "token_usage_last", None):
             compressor.last_prompt_tokens = -1
             compressor.last_completion_tokens = 0
