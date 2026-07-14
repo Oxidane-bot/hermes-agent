@@ -54,10 +54,20 @@ class TestUpdateFromResponse:
             "prompt_tokens": 5000,
             "completion_tokens": 1000,
             "total_tokens": 6000,
+            "request_rough_tokens": 7200,
+            "request_growth_upper_bound": 24_000,
+            "request_continuity_marker": ("tools", ("system", "user")),
+            "request_calibration_valid": True,
         })
         assert compressor.last_prompt_tokens == 5000
         assert compressor.last_completion_tokens == 1000
         assert compressor.last_real_prompt_tokens == 5000
+        assert compressor.last_request_rough_tokens == 7200
+        assert compressor.last_request_growth_upper_bound == 24_000
+        assert compressor.last_request_continuity_marker == (
+            "tools",
+            ("system", "user"),
+        )
         assert compressor.last_rough_tokens_when_real_prompt_fit == 90_000
         assert compressor.awaiting_real_usage_after_compression is False
 
@@ -75,12 +85,158 @@ class TestPreflightDeferral:
         assert compressor.should_defer_preflight_to_real_usage(93_000) is True
         assert compressor.last_rough_tokens_when_real_prompt_fit == 93_000
 
-    def test_does_not_defer_when_rough_growth_is_large(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
+    def test_defers_when_calibrated_upper_estimate_remains_below_threshold(self, compressor):
+        compressor.threshold_tokens = 300_000
+        compressor.last_real_prompt_tokens = 249_000
+        compressor.last_request_rough_tokens = 300_000
+        compressor.last_request_growth_upper_bound = 1_000_000
+        compressor.last_request_continuity_marker = (
+            "tools",
+            ("system", "user"),
+        )
+        compressor.prepare_preflight_continuity_marker(
+            ("tools", ("system", "user", "assistant"))
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=300_700,
+            growth_upper_bound=1_003_000,
+            calibration_allowed=True,
+        )
 
-        assert compressor.should_defer_preflight_to_real_usage(100_000) is False
+        assert compressor.should_defer_preflight_to_real_usage(300_700) is True
+
+    def test_does_not_defer_when_calibrated_upper_estimate_reaches_threshold(self, compressor):
+        compressor.threshold_tokens = 300_000
+        compressor.last_real_prompt_tokens = 249_000
+        compressor.last_request_rough_tokens = 300_000
+        compressor.last_request_growth_upper_bound = 1_000_000
+        compressor.last_request_continuity_marker = (
+            "tools",
+            ("system", "user"),
+        )
+        compressor.prepare_preflight_continuity_marker(
+            ("tools", ("system", "user", "assistant"))
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=340_000,
+            growth_upper_bound=1_050_000,
+            calibration_allowed=True,
+        )
+
+        assert compressor.should_defer_preflight_to_real_usage(340_000) is False
+
+    def test_token_dense_growth_uses_utf8_upper_metric(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_real_prompt_tokens = 80_000
+        compressor.last_request_rough_tokens = 90_000
+        compressor.last_request_growth_upper_bound = 100_000
+        compressor.last_request_continuity_marker = (
+            "tools",
+            ("system", "user"),
+        )
+        compressor.prepare_preflight_continuity_marker(
+            ("tools", ("system", "user", "assistant"))
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=92_000,
+            growth_upper_bound=108_000,
+            calibration_allowed=True,
+        )
+
+        assert compressor.should_defer_preflight_to_real_usage(92_000) is False
+
+    def test_payload_middleware_disables_calibrated_deferral(self, compressor):
+        compressor.threshold_tokens = 100_000
+        compressor.last_real_prompt_tokens = 58_000
+        compressor.last_request_rough_tokens = 113_000
+        compressor.last_request_growth_upper_bound = 300_000
+        compressor.prepare_preflight_calibration(
+            rough_tokens=114_000,
+            growth_upper_bound=304_000,
+            calibration_allowed=False,
+        )
+
+        assert compressor.should_defer_preflight_to_real_usage(114_000) is False
+
+    def test_does_not_defer_when_tool_continuity_marker_changes(self, compressor):
+        compressor.threshold_tokens = 100_000
+        compressor.last_real_prompt_tokens = 50_000
+        compressor.last_request_rough_tokens = 110_000
+        compressor.last_request_growth_upper_bound = 300_000
+        compressor.last_request_continuity_marker = (
+            "tools-a",
+            ("system", "user-1"),
+        )
+        compressor.prepare_preflight_continuity_marker(
+            ("tools-b", ("system", "user-1", "assistant-1"))
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=110_000,
+            growth_upper_bound=300_000,
+            calibration_allowed=True,
+        )
+
+        assert compressor.should_defer_preflight_to_real_usage(110_000) is False
+
+    def test_does_not_defer_when_message_prefix_is_rewritten(self, compressor):
+        compressor.threshold_tokens = 100_000
+        compressor.last_real_prompt_tokens = 50_000
+        compressor.last_request_rough_tokens = 110_000
+        compressor.last_request_growth_upper_bound = 300_000
+        compressor.last_request_continuity_marker = (
+            "tools",
+            ("system", "user-1"),
+        )
+        compressor.prepare_preflight_continuity_marker(
+            ("tools", ("system-rewritten", "user-1", "assistant-1"))
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=110_000,
+            growth_upper_bound=300_000,
+            calibration_allowed=True,
+        )
+
+        assert compressor.should_defer_preflight_to_real_usage(110_000) is False
+
+    def test_invalid_request_pair_does_not_use_legacy_deferral(self, compressor):
+        compressor.threshold_tokens = 100_000
+        compressor.last_real_prompt_tokens = 58_000
+        compressor.last_request_rough_tokens = 113_000
+        compressor.last_request_growth_upper_bound = 300_000
+        compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        compressor.prepare_preflight_calibration(
+            rough_tokens=114_000,
+            growth_upper_bound=299_000,
+            calibration_allowed=True,
+        )
+
+        assert compressor.should_defer_preflight_to_real_usage(114_000) is False
+
+    def test_invalidated_request_usage_clears_legacy_deferral(self, compressor):
+        compressor.threshold_tokens = 100_000
+        compressor.last_real_prompt_tokens = 58_000
+        compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        compressor.last_compression_rough_tokens = 113_000
+
+        compressor.update_from_response(
+            {
+                "prompt_tokens": 40_000,
+                "completion_tokens": 100,
+                "total_tokens": 40_100,
+                "request_rough_tokens": 0,
+                "request_growth_upper_bound": 0,
+                "request_calibration_valid": False,
+            }
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=114_000,
+            growth_upper_bound=304_000,
+            calibration_allowed=True,
+        )
+
+        assert compressor.last_rough_tokens_when_real_prompt_fit == 0
+        assert compressor.last_compression_rough_tokens == 0
+        assert compressor.should_defer_preflight_to_real_usage(114_000) is False
 
     def test_does_not_defer_without_recent_real_usage(self, compressor):
         compressor.threshold_tokens = 85_000
@@ -90,16 +246,43 @@ class TestPreflightDeferral:
         assert compressor.should_defer_preflight_to_real_usage(93_000) is False
 
     def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
-        """#36718: right after a compaction, last_real_prompt_tokens still holds
-        the stale pre-compression value (above threshold). The awaiting flag
-        must force deferral so preflight doesn't fire a SECOND compaction before
-        real post-compaction usage arrives."""
+        """#36718: unchanged post-compression payload defers one extra pass."""
         compressor.threshold_tokens = 85_000
-        # Stale pre-compression value — would hit the `>= threshold => False`
-        # short-circuit and defeat deferral without the flag guard.
         compressor.last_real_prompt_tokens = 120_000
         compressor.awaiting_real_usage_after_compression = True
+        compressor.last_compression_continuity_marker = (
+            "tools",
+            ("system", "summary"),
+        )
+        compressor.prepare_preflight_continuity_marker(
+            ("tools", ("system", "summary", "user"))
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=95_000,
+            growth_upper_bound=300_000,
+            calibration_allowed=False,
+        )
+
         assert compressor.should_defer_preflight_to_real_usage(95_000) is True
+
+    def test_post_compaction_guard_rejects_request_mutation(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_real_prompt_tokens = 120_000
+        compressor.awaiting_real_usage_after_compression = True
+        compressor.last_compression_continuity_marker = (
+            "tools-a",
+            ("system", "summary"),
+        )
+        compressor.prepare_preflight_continuity_marker(
+            ("tools-b", ("system-rewritten", "summary", "user"))
+        )
+        compressor.prepare_preflight_calibration(
+            rough_tokens=95_000,
+            growth_upper_bound=300_000,
+            calibration_allowed=False,
+        )
+
+        assert compressor.should_defer_preflight_to_real_usage(95_000) is False
 
     def test_resumes_normal_deferral_after_flag_cleared(self, compressor):
         """Once update_from_response() clears the flag, the normal baseline/
@@ -110,6 +293,21 @@ class TestPreflightDeferral:
         # Stale-high real prompt with the flag cleared => the >= threshold
         # short-circuit applies => no deferral.
         assert compressor.should_defer_preflight_to_real_usage(95_000) is False
+
+    def test_session_boundaries_clear_request_calibration(self, compressor):
+        compressor.last_real_prompt_tokens = 50_000
+        compressor.last_request_rough_tokens = 90_000
+        compressor.last_request_growth_upper_bound = 300_000
+
+        compressor.on_session_reset()
+        assert compressor.last_request_rough_tokens == 0
+        assert compressor.last_request_growth_upper_bound == 0
+
+        compressor.last_request_rough_tokens = 90_000
+        compressor.last_request_growth_upper_bound = 300_000
+        compressor.on_session_end("sid", [])
+        assert compressor.last_request_rough_tokens == 0
+        assert compressor.last_request_growth_upper_bound == 0
 
 
 
@@ -2833,6 +3031,8 @@ class TestUpdateModelResetsCalibration:
         # Simulate a large-model session that proved a prompt fit.
         comp.last_prompt_tokens = 120_000
         comp.last_real_prompt_tokens = 120_000
+        comp.last_request_rough_tokens = 140_000
+        comp.last_request_growth_upper_bound = 500_000
         comp.last_rough_tokens_when_real_prompt_fit = 130_000
         comp.last_compression_rough_tokens = 130_000
         comp.awaiting_real_usage_after_compression = True
@@ -2842,6 +3042,8 @@ class TestUpdateModelResetsCalibration:
 
         assert comp.last_prompt_tokens == 0
         assert comp.last_real_prompt_tokens == 0
+        assert comp.last_request_rough_tokens == 0
+        assert comp.last_request_growth_upper_bound == 0
         assert comp.last_rough_tokens_when_real_prompt_fit == 0
         assert comp.last_compression_rough_tokens == 0
         assert comp.awaiting_real_usage_after_compression is False

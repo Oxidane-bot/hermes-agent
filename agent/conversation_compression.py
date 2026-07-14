@@ -37,7 +37,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from agent.model_metadata import estimate_request_tokens_rough
+from agent.model_metadata import (
+    build_request_continuity_marker,
+    estimate_request_tokens_rough,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -958,6 +961,13 @@ def compress_context(
             tools=agent.tools or None,
         )
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
+        agent.context_compressor.last_compression_continuity_marker = (
+            build_request_continuity_marker(
+                compressed,
+                system_prompt=new_system_prompt or "",
+                tools=agent.tools or None,
+            )
+        )
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True

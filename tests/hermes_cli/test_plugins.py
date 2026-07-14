@@ -26,6 +26,7 @@ from hermes_cli.middleware import (
     VALID_MIDDLEWARE,
     apply_llm_request_middleware,
     apply_tool_request_middleware,
+    llm_payload_middleware_active,
     run_tool_execution_middleware,
 )
 
@@ -131,6 +132,14 @@ class TestPluginDiscovery:
             {"args": {"path": "README.md", "mw": True}}
         ]
         assert mgr.has_middleware("llm_request") is True
+
+    @pytest.mark.parametrize("kind", ["llm_request", "llm_execution"])
+    def test_llm_payload_middleware_active_detects_rewriters(self, monkeypatch, kind):
+        manager = PluginManager()
+        manager._middleware[kind] = [lambda **_: None]
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        assert llm_payload_middleware_active() is True
 
     def test_execution_middleware_does_not_retry_downstream_failure(self, monkeypatch):
         calls = []

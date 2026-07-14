@@ -728,7 +728,15 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self._last_compress_aborted = False
         self.last_real_prompt_tokens = 0
+        self.last_request_rough_tokens = 0
+        self.last_request_growth_upper_bound = 0
+        self.last_request_continuity_marker = None
+        self._preflight_rough_tokens = 0
+        self._preflight_growth_upper_bound = 0
+        self._preflight_continuity_marker = None
+        self._preflight_calibration_allowed = True
         self.last_compression_rough_tokens = 0
+        self.last_compression_continuity_marker = None
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
 
@@ -764,7 +772,15 @@ class ContextCompressor(ContextEngine):
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
+        self.last_request_rough_tokens = 0
+        self.last_request_growth_upper_bound = 0
+        self.last_request_continuity_marker = None
+        self._preflight_rough_tokens = 0
+        self._preflight_growth_upper_bound = 0
+        self._preflight_continuity_marker = None
+        self._preflight_calibration_allowed = True
         self.last_compression_rough_tokens = 0
+        self.last_compression_continuity_marker = None
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
 
@@ -916,8 +932,16 @@ class ContextCompressor(ContextEngine):
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.last_real_prompt_tokens = 0
+        self.last_request_rough_tokens = 0
+        self.last_request_growth_upper_bound = 0
+        self.last_request_continuity_marker = None
+        self._preflight_rough_tokens = 0
+        self._preflight_growth_upper_bound = 0
+        self._preflight_continuity_marker = None
+        self._preflight_calibration_allowed = True
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.last_compression_rough_tokens = 0
+        self.last_compression_continuity_marker = None
         self.awaiting_real_usage_after_compression = False
         self._ineffective_compression_count = 0
 
@@ -1065,7 +1089,15 @@ class ContextCompressor(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_real_prompt_tokens = 0
+        self.last_request_rough_tokens = 0
+        self.last_request_growth_upper_bound = 0
+        self.last_request_continuity_marker = None
+        self._preflight_rough_tokens = 0
+        self._preflight_growth_upper_bound = 0
+        self._preflight_continuity_marker = None
+        self._preflight_calibration_allowed = True
         self.last_compression_rough_tokens = 0
+        self.last_compression_continuity_marker = None
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
 
@@ -1121,23 +1153,121 @@ class ContextCompressor(ContextEngine):
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
-            if self.last_prompt_tokens < self.threshold_tokens:
+            try:
+                request_rough_tokens = int(usage.get("request_rough_tokens", 0) or 0)
+                request_growth_upper_bound = int(
+                    usage.get("request_growth_upper_bound", 0) or 0
+                )
+            except (TypeError, ValueError):
+                request_rough_tokens = 0
+                request_growth_upper_bound = 0
+            calibration_valid = usage.get("request_calibration_valid")
+            request_continuity_marker = usage.get("request_continuity_marker")
+            # Both values and the continuity marker must describe the same
+            # successful request. Keeping any side of an older tuple beside
+            # newer provider usage would create a convincing but invalid anchor.
+            pair_valid = (
+                request_rough_tokens > 0
+                and request_growth_upper_bound > 0
+                and request_continuity_marker is not None
+            )
+            if pair_valid and calibration_valid is not False:
+                self.last_request_rough_tokens = request_rough_tokens
+                self.last_request_growth_upper_bound = request_growth_upper_bound
+                self.last_request_continuity_marker = request_continuity_marker
+            else:
+                self.last_request_rough_tokens = 0
+                self.last_request_growth_upper_bound = 0
+                self.last_request_continuity_marker = None
+            # An explicitly invalidated request (middleware rewrite, transport
+            # identity change, or malformed matching metadata) must also clear
+            # the legacy rough baseline. Otherwise this request's real usage can
+            # be combined with an older rough estimate on the following turn.
+            calibration_invalidated = calibration_valid is False or (
+                calibration_valid is True and not pair_valid
+            )
+            if calibration_invalidated:
+                self.last_rough_tokens_when_real_prompt_fit = 0
+                self.last_compression_rough_tokens = 0
+                self.last_compression_continuity_marker = None
+            elif self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
             else:
                 self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
 
-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
-        """Return True when a high rough preflight estimate is known-noisy.
+    def prepare_preflight_continuity_marker(self, continuity_marker: Any) -> None:
+        """Attach exact request-prefix continuity metadata to preflight."""
+        self._preflight_continuity_marker = continuity_marker
 
-        ``estimate_request_tokens_rough(..., tools=...)`` intentionally
-        overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful compressed API call,
-        though, provider ``prompt_tokens`` are a better signal than repeating
-        compaction from the same rough schema overhead. Defer only while the
-        rough estimate has grown modestly since a request the provider proved
-        fit under the threshold.
+    def prepare_preflight_calibration(
+        self,
+        *,
+        rough_tokens: int,
+        growth_upper_bound: int,
+        calibration_allowed: bool,
+    ) -> None:
+        """Attach conservative growth metadata to the next preflight check."""
+        self._preflight_rough_tokens = max(0, int(rough_tokens))
+        self._preflight_growth_upper_bound = max(0, int(growth_upper_bound))
+        self._preflight_calibration_allowed = bool(calibration_allowed)
+
+    @staticmethod
+    def _continuity_marker_extends(baseline: Any, current: Any) -> bool:
+        """Return whether current preserves tools and extends message history."""
+        try:
+            baseline_tools, baseline_messages = baseline
+            current_tools, current_messages = current
+        except (TypeError, ValueError):
+            return False
+        if baseline_tools != current_tools:
+            return False
+        if not isinstance(baseline_messages, tuple) or not isinstance(current_messages, tuple):
+            return False
+        return (
+            len(current_messages) >= len(baseline_messages)
+            and current_messages[: len(baseline_messages)] == baseline_messages
+        )
+
+    def _calibrated_prompt_upper_bound(self, rough_tokens: int) -> Optional[int]:
+        """Estimate the current prompt from the latest matching request pair.
+
+        Static estimation error cancels when provider usage anchors the previous
+        request. Newly appended content is charged by UTF-8 byte growth, which
+        is conservative for token-dense Unicode, plus a fixed reserve.
+        """
+        if not self._preflight_calibration_allowed:
+            return None
+        if self._preflight_rough_tokens != int(rough_tokens):
+            return None
+        if not self._continuity_marker_extends(
+            self.last_request_continuity_marker,
+            self._preflight_continuity_marker,
+        ):
+            return None
+        baseline_rough = self.last_request_rough_tokens
+        baseline_upper = self.last_request_growth_upper_bound
+        current_upper = self._preflight_growth_upper_bound
+        if (
+            self.last_real_prompt_tokens <= 0
+            or baseline_rough <= 0
+            or baseline_upper <= 0
+            or current_upper < baseline_upper
+            or int(rough_tokens) < baseline_rough
+        ):
+            return None
+        growth_upper = current_upper - baseline_upper
+        return self.last_real_prompt_tokens + growth_upper + 2048
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+        """Return True when calibrated provider usage remains below threshold.
+
+        Each successful request supplies a matching rough estimate and real
+        provider prompt count. The next request reuses the real count and adds
+        only rough growth, avoiding repeated compression from static estimator
+        bias. The older post-compression baseline remains available for callers
+        that have not yet supplied per-request rough usage.
         """
         if rough_tokens < self.threshold_tokens:
             return False
@@ -1148,14 +1278,34 @@ class ContextCompressor(ContextEngine):
         # compaction fired).  Without this guard that stale value defeats the
         # ``last_real_prompt_tokens >= threshold_tokens`` check below, so
         # preflight fires a SECOND compaction before the provider has reported
-        # real token usage for the now-shorter conversation.  Defer for exactly
-        # one turn; update_from_response() clears the flag when real usage
-        # arrives.  (#36718)
+        # real token usage for the now-shorter conversation. Defer for exactly
+        # one unchanged/append-only request; update_from_response() clears the
+        # flag when real usage arrives. Source tool/system/history mutation
+        # fails closed; request-only context remains ineligible for calibration
+        # but must not trigger an immediate second compaction. (#36718)
         if self.awaiting_real_usage_after_compression:
-            return True
+            return bool(
+                self._preflight_rough_tokens == int(rough_tokens)
+                and self._continuity_marker_extends(
+                    self.last_compression_continuity_marker,
+                    self._preflight_continuity_marker,
+                )
+            )
+        if not self._preflight_calibration_allowed:
+            return False
+        if self._preflight_rough_tokens and self._preflight_rough_tokens != int(rough_tokens):
+            return False
         if self.last_real_prompt_tokens <= 0:
             return False
         if self.last_real_prompt_tokens >= self.threshold_tokens:
+            return False
+
+        calibrated_upper = self._calibrated_prompt_upper_bound(rough_tokens)
+        if calibrated_upper is not None:
+            return calibrated_upper < self.threshold_tokens
+        if self.last_request_rough_tokens or self.last_request_growth_upper_bound:
+            # A captured pair that cannot be validated for this request must
+            # fail closed instead of falling through to the looser legacy path.
             return False
 
         baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens

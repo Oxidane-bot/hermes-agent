@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -49,11 +50,14 @@ from agent.message_sanitization import (
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    build_request_continuity_marker,
     estimate_messages_tokens_rough,
+    estimate_request_growth_upper_bound,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
+    request_contains_images,
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -582,6 +586,7 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        replaceable_payload_context=bool(moa_config),
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -959,8 +964,68 @@ def run_conversation(
         # no room for the model's final answer.
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
+        try:
+            # Freeze the exact tool payload once. Estimation, continuity, and
+            # transport kwargs must all observe this same snapshot even when an
+            # MCP reload atomically replaces ``agent.tools`` mid-request.
+            request_tools = copy.deepcopy(agent.tools or [])
+            request_tools_snapshot_valid = True
+        except Exception:
+            request_tools = agent.tools or []
+            request_tools_snapshot_valid = False
         request_pressure_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+            api_messages, tools=request_tools or None
+        )
+        request_growth_upper_bound = estimate_request_growth_upper_bound(
+            api_messages, tools=request_tools or None
+        )
+        request_continuity_marker = build_request_continuity_marker(
+            api_messages, tools=request_tools or None
+        )
+        preflight_continuity_marker = request_continuity_marker
+        if getattr(
+            agent.context_compressor,
+            "awaiting_real_usage_after_compression",
+            False,
+        ):
+            # The post-compression marker is captured from source history before
+            # API-only whitespace/tool-call normalization. Compare like with
+            # like so #36718's one-request guard does not mistake deterministic
+            # transport normalization for a history mutation.
+            preflight_continuity_marker = build_request_continuity_marker(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=request_tools or None,
+            )
+        request_has_replaceable_context = bool(
+            moa_config
+            or _ext_prefetch_cache
+            or _plugin_user_context
+            or getattr(agent, "ephemeral_system_prompt", None)
+            or getattr(agent, "prefill_messages", None)
+        )
+        request_has_images = request_contains_images(api_messages)
+        try:
+            from hermes_cli.middleware import llm_payload_middleware_active
+
+            request_calibration_allowed = (
+                request_tools_snapshot_valid
+                and bool(request_continuity_marker)
+                and not request_has_images
+                and not (
+                    llm_payload_middleware_active()
+                    or request_has_replaceable_context
+                )
+            )
+        except Exception:
+            # Middleware discovery failures must not make an uncertain payload
+            # eligible for calibrated under-threshold deferral.
+            request_calibration_allowed = False
+        request_calibration_identity = (
+            agent.model,
+            agent.provider,
+            agent.api_mode,
+            agent.base_url,
         )
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -998,6 +1063,20 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        _prepare_continuity = getattr(
+            _compressor, "prepare_preflight_continuity_marker", None
+        )
+        if callable(_prepare_continuity):
+            _prepare_continuity(preflight_continuity_marker)
+        _prepare_calibration = getattr(
+            _compressor, "prepare_preflight_calibration", None
+        )
+        if callable(_prepare_calibration):
+            _prepare_calibration(
+                rough_tokens=request_pressure_tokens,
+                growth_upper_bound=request_growth_upper_bound,
+                calibration_allowed=request_calibration_allowed,
+            )
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )
@@ -1158,7 +1237,10 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                api_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    tools_snapshot=request_tools,
+                )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2089,6 +2171,16 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
+                    response_continuity_marker = build_request_continuity_marker(
+                        api_messages, tools=request_tools or None
+                    )
+                    calibration_matches_request = (
+                        request_calibration_allowed
+                        and request_continuity_marker is not None
+                        and response_continuity_marker == request_continuity_marker
+                        and request_calibration_identity
+                        == (agent.model, agent.provider, agent.api_mode, agent.base_url)
+                    )
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
@@ -2102,6 +2194,19 @@ def run_conversation(
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
+                        # Pair provider usage with estimates for this request
+                        # only when no middleware can replace the payload after
+                        # the preflight measurement.
+                        "request_rough_tokens": (
+                            request_pressure_tokens if calibration_matches_request else 0
+                        ),
+                        "request_growth_upper_bound": (
+                            request_growth_upper_bound if calibration_matches_request else 0
+                        ),
+                        "request_continuity_marker": (
+                            request_continuity_marker if calibration_matches_request else None
+                        ),
+                        "request_calibration_valid": calibration_matches_request,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
 
