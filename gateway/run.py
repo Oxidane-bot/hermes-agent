@@ -229,6 +229,15 @@ def _non_conversational_metadata(
     return merged
 
 
+def _heartbeat_should_send_replacement(edit_result: Any) -> bool:
+    """Return True when a heartbeat edit result should fall back to send()."""
+    if edit_result is None:
+        return True
+    if getattr(edit_result, "success", False):
+        return False
+    return not bool(getattr(edit_result, "retryable", False))
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -8699,6 +8708,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _maybe_intercept_clarify_reply(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> bool:
+        """Resolve pending gateway clarify prompts from text or voice transcript."""
+        _clarify_mod = None
+        try:
+            from tools import clarify_gateway as _clarify_mod
+            _pending_clarify = _clarify_mod.get_pending_for_session(
+                session_key,
+                include_choice_prompts=True,
+            )
+        except Exception:
+            _pending_clarify = None
+        if _pending_clarify is None or _clarify_mod is None:
+            return False
+
+        _raw_clarify_reply = (event.text or "").strip()
+        if (
+            not _raw_clarify_reply
+            and event.message_type == MessageType.VOICE
+            and event.get_command() is None
+        ):
+            try:
+                _prepared_clarify_reply = await self._prepare_inbound_message_text(
+                    event=event,
+                    source=source,
+                    history=[],
+                    session_key=session_key,
+                )
+                _raw_clarify_reply = (_prepared_clarify_reply or "").strip()
+            except Exception:
+                logger.debug(
+                    "Gateway clarify voice transcript preparation failed",
+                    exc_info=True,
+                )
+
+        # Skip slash commands: the user clearly wanted a command, not a
+        # clarify answer. Leave the prompt pending so they can retry.
+        if not _raw_clarify_reply or _raw_clarify_reply.startswith("/"):
+            return False
+
+        _resolved = _clarify_mod.resolve_text_response_for_session(
+            session_key,
+            _raw_clarify_reply,
+        )
+        if _resolved:
+            logger.info(
+                "Gateway intercepted clarify text response (session=%s, id=%s)",
+                session_key,
+                _pending_clarify.clarify_id,
+            )
+        return bool(_resolved)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -8922,38 +8987,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 _update_prompts.pop(_quick_key, None)
 
-        # Intercept messages that are responses to a pending clarify.
-        # Open-ended prompts and "Other" responses are captured as free text;
-        # direct replies to multi-choice prompts are accepted too ("2" maps
-        # to the second option, arbitrary text becomes a custom answer). Slash
-        # commands still bypass this path so /stop and friends keep working.
-        _clarify_mod = None
-        try:
-            from tools import clarify_gateway as _clarify_mod
-            _pending_clarify = _clarify_mod.get_pending_for_session(
-                _quick_key, include_choice_prompts=True,
-            )
-        except Exception:
-            _pending_clarify = None
-        if _pending_clarify is not None and _clarify_mod is not None:
-            _raw_clarify_reply = (event.text or "").strip()
-            # Skip slash commands — the user clearly wanted to issue a
-            # command, not answer the clarify.  Leave the clarify pending
-            # so the user can retry; if it times out, the agent unblocks
-            # with an empty response.
-            if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
-                )
-                if _resolved:
-                    logger.info(
-                        "Gateway intercepted clarify text response (session=%s, id=%s)",
-                        _quick_key, _pending_clarify.clarify_id,
-                    )
-                    # Acknowledge with empty string so adapters that emit
-                    # the agent's response don't double-post.  The agent
-                    # itself will produce the next user-facing message.
-                    return ""
+        if await self._maybe_intercept_clarify_reply(event, source, _quick_key):
+            # Acknowledge with empty string so adapters that emit the agent's
+            # response don't double-post.  The agent itself will produce the
+            # next user-facing message.
+            return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
@@ -16853,11 +16891,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-        # True when the previously enqueued progress line was a terminal
-        # fenced code block — consecutive terminal calls then drop the
-        # repeated "💻 terminal" header and render back-to-back blocks.
-        last_was_terminal_block = [False]
-
         # ── Discord voice "verbal ack before tool calls" ────────────────
         # When the bot is in a voice channel with the continuous mixer
         # installed (discord.voice_fx.enabled), speak a short phrase ("let me
@@ -17013,60 +17046,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
 
-            # Markdown-capable platforms render a terminal command as a fenced
-            # code block instead of the compact `terminal: "cmd…"` preview.
-            # Gated on the adapter's ``supports_code_blocks`` capability so
-            # plain-text platforms keep the short line.  No language tag is
-            # emitted — Slack mrkdwn renders the tag as a literal first code
-            # line ("bash"), and a bare fence renders correctly everywhere
-            # that supports blocks.
-            #
-            # Verbose mode shows the FULL command.  Non-verbose ("all"/"new")
-            # modes still wrap in a fence but truncate to a single line capped
-            # at ``tool_preview_length`` (default 40) so a long or multi-line
-            # command doesn't render as a huge block — matching the budget the
-            # non-terminal preview path already applies (#42634).
-            _code_block_full = None
-            _code_block_short = None
-            try:
-                _progress_adapter = self._adapter_for_source(source)
-            except Exception:
-                _progress_adapter = None
-            if (
-                getattr(_progress_adapter, "supports_code_blocks", False)
-                and tool_name == "terminal"
-                and isinstance(args, dict)
-                and isinstance(args.get("command"), str)
-                and args["command"].strip()
-            ):
-                from agent.display import get_tool_preview_max_len
-                _cmd_full = args["command"].rstrip()
-                # Consecutive terminal calls: drop the repeated
-                # "💻 terminal" header so back-to-back commands render as
-                # adjacent code blocks under a single header.
-                _block_header = (
-                    "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
-                )
-                _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
-                # Single-line, capped preview for non-verbose modes.
-                _pl = get_tool_preview_max_len()
-                _cap = _pl if _pl > 0 else 40
-                _lines = _cmd_full.splitlines()
-                _cmd_short = _lines[0] if _lines else _cmd_full
-                _multiline = len(_lines) > 1
-                if len(_cmd_short) > _cap:
-                    _cmd_short = _cmd_short[:_cap - 3] + "..."
-                elif _multiline:
-                    _cmd_short = _cmd_short + " ..."
-                _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
-
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
-                if _code_block_full is not None:
-                    last_was_terminal_block[0] = True
-                    progress_queue.put(_code_block_full)
-                    return
-                last_was_terminal_block[0] = False
                 if args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
@@ -17087,12 +17068,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # "all" / "new" modes: short preview, respects tool_preview_length
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
-            # Terminal commands on markdown platforms get a single-line capped
-            # fenced block (built above) instead of the truncated preview.
-            if _code_block_short is not None:
-                msg = _code_block_short
-                last_was_terminal_block[0] = True
-            elif preview:
+            if preview:
                 from agent.display import (
                     get_tool_preview_max_len,
                     get_tool_verb,
@@ -17116,10 +17092,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
                 else:
                     msg = f"{emoji} {tool_name}: \"{preview}\""
-                last_was_terminal_block[0] = False
             else:
                 msg = f"{emoji} {tool_name}..."
-                last_was_terminal_block[0] = False
             
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same
@@ -19089,7 +19063,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
+                    if _heartbeat_should_send_replacement(_notify_res):
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,

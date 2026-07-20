@@ -1703,6 +1703,34 @@ class TestBuildApiKwargs:
         assert kwargs["messages"] is messages
         assert kwargs["timeout"] == 1800.0
 
+    def test_uses_explicit_tools_snapshot(self, agent):
+        messages = [{"role": "user", "content": "hi"}]
+        frozen_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "frozen",
+                    "description": "small",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        agent.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "live-replacement",
+                    "description": "large" * 1000,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        kwargs = agent._build_api_kwargs(messages, tools_snapshot=frozen_tools)
+
+        assert kwargs["tools"] == frozen_tools
+        assert kwargs["tools"] is not agent.tools
+
     def test_public_moonshot_kimi_k2_5_omits_temperature(self, agent):
         """Kimi models should NOT have client-side temperature overrides.
 
@@ -4751,7 +4779,7 @@ class TestRunConversation:
         agent.max_tokens = None
         requested_caps = []
 
-        def _fake_build_api_kwargs(api_messages):
+        def _fake_build_api_kwargs(api_messages, *, tools_snapshot=None):
             ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
             if ephemeral is not None:
                 agent._ephemeral_max_output_tokens = None

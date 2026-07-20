@@ -267,6 +267,9 @@ def _record_codex_app_server_compaction(
             compressor, "compression_count", 0
         ) + 1
         compressor.last_compression_rough_tokens = approx_tokens or 0
+        compressor.last_compression_continuity_marker = getattr(
+            compressor, "_preflight_continuity_marker", None
+        )
         if not getattr(turn, "token_usage_last", None):
             compressor.last_prompt_tokens = -1
             compressor.last_completion_tokens = 0
