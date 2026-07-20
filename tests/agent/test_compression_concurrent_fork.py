@@ -78,6 +78,11 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     compressor._last_aux_model_failure_model = None
     compressor._last_aux_model_failure_error = None
     agent.context_compressor = compressor
+    # Keep this fixture focused on the compression-lock protocol. The lazy
+    # auxiliary-provider feasibility probe runs before lock acquisition and can
+    # serialize the two worker threads when no real credentials are available,
+    # defeating the intentional overlap above without exercising the lock.
+    agent._compression_feasibility_checked = True
     # These tests cover the ROTATION fallback path (forking, child sessions,
     # lock contention) — pin in_place=False so they keep exercising it
     # regardless of the global default (which flipped to True in #38763).
