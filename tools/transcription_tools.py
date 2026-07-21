@@ -4,8 +4,8 @@ Transcription Tools Module
 
 Provides speech-to-text transcription with six providers:
 
-  - **local** (default, free) — faster-whisper running locally, no API key needed.
-    Auto-downloads the model (~150 MB for ``base``) on first use.
+  - **local** (default, free) — whisper.cpp + Metal on prepared Apple Silicon
+    systems, otherwise faster-whisper. No API key needed.
   - **groq** (free tier) — Groq Whisper API, requires ``GROQ_API_KEY``.
   - **openai** (paid) — OpenAI Whisper API, requires ``VOICE_TOOLS_OPENAI_KEY``.
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
@@ -29,6 +29,7 @@ Usage::
 
 import logging
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -87,6 +88,7 @@ _HAS_MISTRAL = _safe_find_spec("mistralai")
 DEFAULT_PROVIDER = "local"
 DEFAULT_LOCAL_MODEL = "base"
 DEFAULT_LOCAL_STT_LANGUAGE = "en"
+DEFAULT_LOCAL_BACKEND = "auto"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
@@ -160,6 +162,74 @@ def _find_ffmpeg_binary() -> Optional[str]:
 
 def _find_whisper_binary() -> Optional[str]:
     return _find_binary("whisper")
+
+
+def _find_whisper_cpp_binary() -> Optional[str]:
+    return _find_binary("whisper-cli")
+
+
+def _is_apple_silicon() -> bool:
+    """Return whether this process is running natively on Apple Silicon."""
+    return platform.system() == "Darwin" and platform.machine().lower() in {
+        "arm64", "aarch64",
+    }
+
+
+def _whisper_cpp_model_filename(model_name: str) -> str:
+    """Map faster-whisper model aliases to official whisper.cpp Q8 names."""
+    aliases = {
+        "turbo": "large-v3-turbo",
+        "large-v3-turbo": "large-v3-turbo",
+    }
+    normalized = aliases.get(model_name, model_name)
+    return f"ggml-{normalized}-q8_0.bin"
+
+
+def _resolve_whisper_cpp_backend(
+    local_cfg: Dict[str, Any],
+    model_name: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(binary, model_path)`` when whisper.cpp is ready to run."""
+    binary = _find_whisper_cpp_binary()
+    configured_path = str(local_cfg.get("whisper_cpp_model_path") or "").strip()
+    if configured_path:
+        model_path = Path(configured_path).expanduser()
+    else:
+        from hermes_constants import get_hermes_home
+
+        model_path = (
+            get_hermes_home()
+            / "models"
+            / "whisper.cpp"
+            / _whisper_cpp_model_filename(model_name)
+        )
+    if not binary or not model_path.is_file():
+        return None, None
+    return binary, str(model_path)
+
+
+def _local_backend_mode(local_cfg: Dict[str, Any]) -> str:
+    raw = str(local_cfg.get("backend") or DEFAULT_LOCAL_BACKEND).strip().lower()
+    aliases = {
+        "faster-whisper": "faster_whisper",
+        "whisper.cpp": "whisper_cpp",
+        "whisper-cpp": "whisper_cpp",
+    }
+    mode = aliases.get(raw, raw)
+    if mode not in {"auto", "faster_whisper", "whisper_cpp"}:
+        logger.warning("Unknown stt.local.backend '%s'; using auto", raw)
+        return DEFAULT_LOCAL_BACKEND
+    return mode
+
+
+def _should_try_whisper_cpp(local_cfg: Dict[str, Any], model_name: str) -> bool:
+    mode = _local_backend_mode(local_cfg)
+    if mode == "whisper_cpp":
+        return True
+    if mode != "auto" or not _is_apple_silicon():
+        return False
+    binary, model_path = _resolve_whisper_cpp_backend(local_cfg, model_name)
+    return bool(binary and model_path)
 
 
 def _get_local_command_template() -> Optional[str]:
@@ -763,6 +833,12 @@ def _get_provider(stt_config: dict) -> str:
 
     if explicit:
         if provider == "local":
+            local_cfg = _get_stt_section(stt_config, "local")
+            local_model = _normalize_local_model(
+                local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+            )
+            if _should_try_whisper_cpp(local_cfg, local_model):
+                return "local"
             if _HAS_FASTER_WHISPER:
                 return "local"
             if _has_local_command():
@@ -849,6 +925,10 @@ def _get_provider(stt_config: dict) -> str:
     # intentionally skipped while `mistralai` is quarantined on PyPI (malicious
     # 2.4.6 release on 2026-05-12).
 
+    local_cfg = _get_stt_section(stt_config, "local")
+    local_model = _normalize_local_model(local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+    if _should_try_whisper_cpp(local_cfg, local_model):
+        return "local"
     if _HAS_FASTER_WHISPER:
         return "local"
     if _has_local_command():
@@ -1193,10 +1273,15 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
 
 
-def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
+def _prepare_local_audio(
+    file_path: str,
+    work_dir: str,
+    native_formats: Optional[set[str]] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Normalize audio for local CLI STT when needed."""
     audio_path = Path(file_path)
-    if audio_path.suffix.lower() in LOCAL_NATIVE_AUDIO_FORMATS:
+    accepted_formats = native_formats or LOCAL_NATIVE_AUDIO_FORMATS
+    if audio_path.suffix.lower() in accepted_formats:
         return file_path, None
 
     ffmpeg = _find_ffmpeg_binary()
@@ -1216,6 +1301,155 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
         details = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error("ffmpeg conversion failed for %s: %s", file_path, details)
         return None, f"Failed to convert audio for local STT: {details}"
+
+
+def _transcribe_whisper_cpp(
+    file_path: str,
+    model_name: str,
+    local_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Transcribe with whisper.cpp, using Metal automatically on Apple Silicon."""
+    binary, model_path = _resolve_whisper_cpp_backend(local_cfg, model_name)
+    if not binary or not model_path:
+        return {
+            "success": False,
+            "transcript": "",
+            "provider": "local",
+            "backend": "whisper_cpp",
+            "error": (
+                "whisper.cpp backend unavailable: install whisper-cli and place "
+                f"{_whisper_cpp_model_filename(model_name)} under "
+                "the Hermes models/whisper.cpp directory, or configure "
+                "stt.local.whisper_cpp_model_path"
+            ),
+        }
+
+    language = str(local_cfg.get("language") or "auto").strip() or "auto"
+    try:
+        configured_threads = int(local_cfg.get("whisper_cpp_threads") or 0)
+    except (TypeError, ValueError):
+        configured_threads = 0
+    threads = (
+        configured_threads
+        if configured_threads > 0
+        else min(16, max(1, os.cpu_count() or 4))
+    )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-whisper-cpp-") as output_dir:
+            # whisper.cpp's bundled decoder does not reliably accept Telegram
+            # Opus/OGG, even though the CLI advertises OGG support. Normalize
+            # everything except WAV through ffmpeg before invoking it.
+            prepared_input, prep_error = _prepare_local_audio(
+                file_path, output_dir, native_formats={".wav"},
+            )
+            if prep_error:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "provider": "local",
+                    "backend": "whisper_cpp",
+                    "error": prep_error,
+                }
+
+            output_base = Path(output_dir) / "transcript"
+            command = [
+                binary,
+                "-m", model_path,
+                "-f", prepared_input,
+                "-l", language,
+                "-t", str(threads),
+                "-bs", "5",
+                "-bo", "5",
+                "-otxt",
+                "-of", str(output_base),
+                "-np",
+            ]
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+            )
+            transcript_path = output_base.with_suffix(".txt")
+            if not transcript_path.is_file():
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "provider": "local",
+                    "backend": "whisper_cpp",
+                    "error": "whisper.cpp completed without producing a transcript",
+                }
+            transcript = transcript_path.read_text(encoding="utf-8").strip()
+            if not transcript:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "provider": "local",
+                    "backend": "whisper_cpp",
+                    "error": "whisper.cpp returned an empty transcript",
+                }
+            logger.info(
+                "Transcribed %s via whisper.cpp (%s, %d chars)",
+                Path(file_path).name,
+                model_name,
+                len(transcript),
+            )
+            return {
+                "success": True,
+                "transcript": transcript,
+                "provider": "local",
+                "backend": "whisper_cpp",
+            }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "transcript": "",
+            "provider": "local",
+            "backend": "whisper_cpp",
+            "error": "whisper.cpp transcription timed out after 300 seconds",
+        }
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or str(exc)).strip()
+        logger.error("whisper.cpp transcription failed: %s", details)
+        return {
+            "success": False,
+            "transcript": "",
+            "provider": "local",
+            "backend": "whisper_cpp",
+            "error": f"whisper.cpp transcription failed: {details}",
+        }
+    except Exception as exc:
+        logger.error("Unexpected whisper.cpp transcription error: %s", exc, exc_info=True)
+        return {
+            "success": False,
+            "transcript": "",
+            "provider": "local",
+            "backend": "whisper_cpp",
+            "error": f"whisper.cpp transcription failed: {exc}",
+        }
+
+
+def _transcribe_local_backend(
+    file_path: str,
+    model_name: str,
+    local_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Dispatch the local provider to whisper.cpp or faster-whisper."""
+    mode = _local_backend_mode(local_cfg)
+    if _should_try_whisper_cpp(local_cfg, model_name):
+        result = _transcribe_whisper_cpp(file_path, model_name, local_cfg)
+        if result.get("success") or mode == "whisper_cpp":
+            return result
+        logger.warning(
+            "Apple Silicon whisper.cpp transcription failed (%s); "
+            "falling back to faster-whisper",
+            result.get("error", "unknown error"),
+        )
+    return _transcribe_local(file_path, model_name)
 
 
 def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]:
@@ -1749,7 +1983,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = _normalize_local_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
-        return _transcribe_local(file_path, model_name)
+        return _transcribe_local_backend(file_path, model_name, local_cfg)
 
     if provider == "local_command":
         local_cfg = stt_config.get("local") or {}

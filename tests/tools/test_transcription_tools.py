@@ -73,6 +73,167 @@ def clean_env(monkeypatch):
 # _get_provider — full permutation matrix
 # ============================================================================
 
+
+class TestAppleSiliconWhisperCpp:
+    def test_platform_detection_requires_darwin_arm64(self):
+        from tools.transcription_tools import _is_apple_silicon
+
+        with patch("tools.transcription_tools.platform.system", return_value="Darwin"), \
+             patch("tools.transcription_tools.platform.machine", return_value="arm64"):
+            assert _is_apple_silicon() is True
+        with patch("tools.transcription_tools.platform.system", return_value="Darwin"), \
+             patch("tools.transcription_tools.platform.machine", return_value="x86_64"):
+            assert _is_apple_silicon() is False
+        with patch("tools.transcription_tools.platform.system", return_value="Linux"), \
+             patch("tools.transcription_tools.platform.machine", return_value="aarch64"):
+            assert _is_apple_silicon() is False
+
+    def test_turbo_alias_uses_official_q8_filename(self):
+        from tools.transcription_tools import _whisper_cpp_model_filename
+
+        assert (
+            _whisper_cpp_model_filename("turbo")
+            == "ggml-large-v3-turbo-q8_0.bin"
+        )
+
+    def test_default_model_path_is_profile_scoped(self, tmp_path, monkeypatch):
+        from tools.transcription_tools import _resolve_whisper_cpp_backend
+
+        hermes_home = tmp_path / "profile"
+        model = (
+            hermes_home
+            / "models"
+            / "whisper.cpp"
+            / "ggml-large-v3-turbo-q8_0.bin"
+        )
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"model")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with patch(
+            "tools.transcription_tools._find_whisper_cpp_binary",
+            return_value="/opt/homebrew/bin/whisper-cli",
+        ):
+            binary, model_path = _resolve_whisper_cpp_backend({}, "turbo")
+
+        assert binary == "/opt/homebrew/bin/whisper-cli"
+        assert model_path == str(model)
+
+    def test_explicit_local_is_available_with_whisper_cpp_only(self):
+        from tools.transcription_tools import _get_provider
+
+        config = {
+            "provider": "local",
+            "local": {"backend": "whisper_cpp", "model": "turbo"},
+        }
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._try_lazy_install_stt") as lazy:
+            assert _get_provider(config) == "local"
+        lazy.assert_not_called()
+
+    def test_auto_prefers_whisper_cpp_on_prepared_apple_silicon(self):
+        from tools.transcription_tools import _transcribe_local_backend
+
+        cpp_result = {
+            "success": True,
+            "transcript": "metal",
+            "provider": "local",
+            "backend": "whisper_cpp",
+        }
+        with patch("tools.transcription_tools._is_apple_silicon", return_value=True), \
+             patch(
+                 "tools.transcription_tools._resolve_whisper_cpp_backend",
+                 return_value=("/opt/homebrew/bin/whisper-cli", "/tmp/model.bin"),
+             ), \
+             patch(
+                 "tools.transcription_tools._transcribe_whisper_cpp",
+                 return_value=cpp_result,
+             ) as cpp, \
+             patch("tools.transcription_tools._transcribe_local") as faster:
+            result = _transcribe_local_backend("/tmp/audio.ogg", "turbo", {})
+
+        assert result == cpp_result
+        cpp.assert_called_once()
+        faster.assert_not_called()
+
+    def test_auto_keeps_faster_whisper_off_apple_silicon(self):
+        from tools.transcription_tools import _transcribe_local_backend
+
+        faster_result = {"success": True, "transcript": "cpu", "provider": "local"}
+        with patch("tools.transcription_tools._is_apple_silicon", return_value=False), \
+             patch(
+                 "tools.transcription_tools._transcribe_local",
+                 return_value=faster_result,
+             ) as faster, \
+             patch("tools.transcription_tools._transcribe_whisper_cpp") as cpp:
+            result = _transcribe_local_backend("/tmp/audio.ogg", "turbo", {})
+
+        assert result == faster_result
+        faster.assert_called_once()
+        cpp.assert_not_called()
+
+    def test_auto_falls_back_when_metal_transcription_fails(self):
+        from tools.transcription_tools import _transcribe_local_backend
+
+        with patch("tools.transcription_tools._is_apple_silicon", return_value=True), \
+             patch(
+                 "tools.transcription_tools._resolve_whisper_cpp_backend",
+                 return_value=("/opt/homebrew/bin/whisper-cli", "/tmp/model.bin"),
+             ), \
+             patch(
+                 "tools.transcription_tools._transcribe_whisper_cpp",
+                 return_value={"success": False, "error": "Metal failed"},
+             ), \
+             patch(
+                 "tools.transcription_tools._transcribe_local",
+                 return_value={"success": True, "transcript": "fallback"},
+             ) as faster:
+            result = _transcribe_local_backend("/tmp/audio.ogg", "turbo", {})
+
+        assert result["transcript"] == "fallback"
+        faster.assert_called_once()
+
+    def test_explicit_whisper_cpp_does_not_silently_change_backend(self):
+        from tools.transcription_tools import _transcribe_local_backend
+
+        failure = {"success": False, "error": "model missing"}
+        with patch(
+            "tools.transcription_tools._transcribe_whisper_cpp",
+            return_value=failure,
+        ), patch("tools.transcription_tools._transcribe_local") as faster:
+            result = _transcribe_local_backend(
+                "/tmp/audio.ogg", "turbo", {"backend": "whisper_cpp"},
+            )
+
+        assert result == failure
+        faster.assert_not_called()
+
+    def test_whisper_cpp_runner_writes_standard_result(self, sample_wav):
+        from pathlib import Path
+        from tools.transcription_tools import _transcribe_whisper_cpp
+
+        def fake_run(command, **kwargs):
+            output_base = Path(command[command.index("-of") + 1])
+            output_base.with_suffix(".txt").write_text("你好 Hermes\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch(
+            "tools.transcription_tools._resolve_whisper_cpp_backend",
+            return_value=("/opt/homebrew/bin/whisper-cli", "/tmp/model.bin"),
+        ), patch("tools.transcription_tools.subprocess.run", side_effect=fake_run) as run:
+            result = _transcribe_whisper_cpp(sample_wav, "turbo", {"language": "auto"})
+
+        assert result == {
+            "success": True,
+            "transcript": "你好 Hermes",
+            "provider": "local",
+            "backend": "whisper_cpp",
+        }
+        command = run.call_args.args[0]
+        assert command[0] == "/opt/homebrew/bin/whisper-cli"
+        assert command[command.index("-l") + 1] == "auto"
+        assert "-ng" not in command
+
 class TestGetProviderGroq:
     """Groq-specific provider selection tests."""
 
